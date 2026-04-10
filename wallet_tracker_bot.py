@@ -24,8 +24,8 @@ from telegram.constants import ParseMode
 # ──────────────────────────────────────────────────────
 # AYARLAR
 # ──────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN      = "7879516551:AAFdjViydhgRvVgdW4Rq3UMxYds1H45OzLo"
-TELEGRAM_CHAT_ID        = "7879516551"
+TELEGRAM_BOT_TOKEN      = "8649558470:AAHCRXTKxCiVi2MaAp88trJVe7McE8v7j9k"
+TELEGRAM_CHAT_ID        = "492272237"
 
 WALLETS = {
     "bc1qx37z09wa8uw0r9s9rhkg24a9zl88p92qn8reqq": {
