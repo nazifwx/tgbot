@@ -50,7 +50,7 @@ POLYGONSCAN_API_KEY     = os.getenv("POLYGONSCAN_API_KEY", "RGSD69N6JG2KM9IIMJME
 
 # Alchemy API key — Polygon mempool (pending) için WebSocket
 # Ücretsiz: https://dashboard.alchemy.com → yeni app → Polygon Mainnet
-ALCHEMY_API_KEY         = os.getenv("ALCHEMY_API_KEY", "ALCHEMY_KEY_BURAYA")
+ALCHEMY_API_KEY         = os.getenv("ALCHEMY_API_KEY", "3JbUlCuAJFfubuinvxdvL")
 ALCHEMY_WS_URL          = f"wss://polygon-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 
 DAILY_REPORT_HOUR       = 20     # UTC
