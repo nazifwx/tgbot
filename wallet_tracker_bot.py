@@ -1,10 +1,19 @@
 """
 Telegram Cuzdan Takip Botu
 - 2x BTC cüzdanı (mempool + confirmed)
-- 1x Polygon USDT (30sn polling — blok süresi 2sn olduğu için yeterli)
+- 2x Polygon USDT (30sn polling — blok süresi 2sn olduğu için yeterli)
 - Inline butonlar
 - Günlük özet raporu
 - /komutlar desteği
+
+RAM OPTIMIZASYONLARI (islev kaybi olmadan):
+  1) Tum HTTP istekleri icin tek, paylasimli aiohttp.ClientSession kullanilir.
+     Eskiden her kontrol dongusunde / her komutta yeni bir session acilip
+     kapatiliyordu (yeni connector havuzu = fazladan bellek + GC yuku).
+  2) daily_txs artik ham (raw) API cevabini degil, sadece rapor icin
+     gereken minimal alanlari (miktar, yon, tip) saklar. BTC/Polygon ham
+     JSON'lari (vin/vout, gas bilgisi, log index vs.) gun icinde onlarca
+     islem biriktiginde gereksiz yere bellek tuketiyordu.
 """
 
 import asyncio
@@ -41,6 +50,11 @@ WALLETS = {
         "network": "polygon",
         "symbol":  "USDT",
     },
+    "0xA6846f4b81025adCBe00dAde4daeEdc3C3E0aD14": {
+        "address": "0xA6846f4b81025adCBe00dAde4daeEdc3C3E0aD14",
+        "network": "polygon",
+        "symbol":  "USDT",
+    },
 }
 
 USDT_CONTRACT          = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
@@ -74,7 +88,11 @@ def save_json(path, data):
 
 seen_txs    = load_json(STATE_FILE)
 pending_txs = load_json(PENDING_FILE)
+# Artik ham tx degil, minimal ozet dict tutuluyor: {"type":..,"amount":..,"is_in":..,"symbol":..}
 daily_txs   = {name: [] for name in WALLETS}
+
+# Tum HTTP cagrilari icin tek paylasimli session (main() icinde olusturulur)
+HTTP_SESSION: aiohttp.ClientSession | None = None
 
 # ──────────────────────────────────────────────────────
 # YARDIMCI
@@ -133,7 +151,7 @@ def main_menu_keyboard():
     ])
 
 # ──────────────────────────────────────────────────────
-# API
+# API  (hepsi artik parametre olarak gelen paylasimli session'i kullanir)
 # ──────────────────────────────────────────────────────
 async def fetch_btc_txs(address, session):
     try:
@@ -298,108 +316,121 @@ def format_confirmed_update(wallet_name, txid, extra=""):
 async def initialize_snapshots():
     global seen_txs
     log.info("Snapshot aliniyor...")
-    async with aiohttp.ClientSession() as session:
-        for name, cfg in WALLETS.items():
-            address = cfg["address"]
-            ids = []
-            if cfg["network"] == "btc":
-                txs     = await fetch_btc_txs(address, session)
-                mempool = await fetch_btc_mempool_txs(address, session)
-                ids     = [tx["txid"] for tx in txs[:20]] + [tx["txid"] for tx in mempool]
-            elif cfg["network"] == "polygon":
-                txs = await fetch_polygon_confirmed(address, session)
-                ids = [tx["hash"] for tx in txs[:20]]
+    for name, cfg in WALLETS.items():
+        address = cfg["address"]
+        ids = []
+        if cfg["network"] == "btc":
+            txs     = await fetch_btc_txs(address, HTTP_SESSION)
+            mempool = await fetch_btc_mempool_txs(address, HTTP_SESSION)
+            ids     = [tx["txid"] for tx in txs[:20]] + [tx["txid"] for tx in mempool]
+        elif cfg["network"] == "polygon":
+            txs = await fetch_polygon_confirmed(address, HTTP_SESSION)
+            ids = [tx["hash"] for tx in txs[:20]]
 
-            if name not in seen_txs:
-                seen_txs[name] = ids
-            else:
-                existing = set(seen_txs[name])
-                seen_txs[name].extend(i for i in ids if i not in existing)
-            log.info(f"  {name}: {len(ids)} eski islem isaretlendi")
+        if name not in seen_txs:
+            seen_txs[name] = ids
+        else:
+            existing = set(seen_txs[name])
+            seen_txs[name].extend(i for i in ids if i not in existing)
+        log.info(f"  {name}: {len(ids)} eski islem isaretlendi")
 
     save_json(STATE_FILE, seen_txs)
     log.info("Snapshot tamamlandi.")
+
+# ──────────────────────────────────────────────────────
+# DAILY_TXS ICIN MINIMAL OZET CIKARIMI (RAM optimizasyonu)
+# ──────────────────────────────────────────────────────
+def _summarize_btc(tx, address):
+    vout   = tx.get("vout", [])
+    amount = sum(o.get("value", 0) for o in vout if o.get("scriptpubkey_address") == address) / 1e8
+    is_in  = any(o.get("scriptpubkey_address") == address for o in vout)
+    return {"type": "btc", "amount": amount, "is_in": is_in}
+
+def _summarize_polygon(tx, address):
+    amount = int(tx.get("value", 0)) / 1e6
+    is_in  = tx.get("to", "").lower() == address.lower()
+    return {"type": "polygon_usdt", "amount": amount, "is_in": is_in}
 
 # ──────────────────────────────────────────────────────
 # ANA KONTROL DÖNGÜSÜ
 # ──────────────────────────────────────────────────────
 async def check_wallets(bot: Bot):
     global seen_txs, pending_txs
-    async with aiohttp.ClientSession() as session:
-        for name, cfg in WALLETS.items():
-            address = cfg["address"]
-            network = cfg["network"]
+    session = HTTP_SESSION
+    for name, cfg in WALLETS.items():
+        address = cfg["address"]
+        network = cfg["network"]
 
-            # ── BTC ──
-            if network == "btc":
-                # Mempool (pending)
-                for tx in await fetch_btc_mempool_txs(address, session):
-                    txid = tx["txid"]
-                    if txid not in seen_txs.get(name, []):
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=format_btc_tx(name, address, tx, is_pending=True),
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=btc_tx_keyboard(txid),
-                            disable_web_page_preview=True,
-                        )
-                        seen_txs.setdefault(name, []).append(txid)
-                        pending_txs[txid] = {"wallet": name, "type": "btc"}
-                        daily_txs[name].append({"txid": txid, "type": "btc", "raw": tx, "address": address})
+        # ── BTC ──
+        if network == "btc":
+            # Mempool (pending)
+            for tx in await fetch_btc_mempool_txs(address, session):
+                txid = tx["txid"]
+                if txid not in seen_txs.get(name, []):
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=format_btc_tx(name, address, tx, is_pending=True),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=btc_tx_keyboard(txid),
+                        disable_web_page_preview=True,
+                    )
+                    seen_txs.setdefault(name, []).append(txid)
+                    pending_txs[txid] = {"wallet": name, "type": "btc"}
+                    daily_txs[name].append(_summarize_btc(tx, address))
 
-                # Confirmed
-                for tx in (await fetch_btc_txs(address, session))[:10]:
-                    txid = tx["txid"]
-                    if txid in pending_txs:
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=format_confirmed_update(name, txid),
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=btc_tx_keyboard(txid),
-                            disable_web_page_preview=True,
-                        )
-                        del pending_txs[txid]
-                    elif txid not in seen_txs.get(name, []):
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=format_btc_tx(name, address, tx, is_pending=False),
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=btc_tx_keyboard(txid),
-                            disable_web_page_preview=True,
-                        )
-                        seen_txs.setdefault(name, []).append(txid)
-                        daily_txs[name].append({"txid": txid, "type": "btc", "raw": tx, "address": address})
+            # Confirmed
+            for tx in (await fetch_btc_txs(address, session))[:10]:
+                txid = tx["txid"]
+                if txid in pending_txs:
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=format_confirmed_update(name, txid),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=btc_tx_keyboard(txid),
+                        disable_web_page_preview=True,
+                    )
+                    del pending_txs[txid]
+                elif txid not in seen_txs.get(name, []):
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=format_btc_tx(name, address, tx, is_pending=False),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=btc_tx_keyboard(txid),
+                        disable_web_page_preview=True,
+                    )
+                    seen_txs.setdefault(name, []).append(txid)
+                    daily_txs[name].append(_summarize_btc(tx, address))
 
-                seen_txs[name] = seen_txs.get(name, [])[-100:]
+            seen_txs[name] = seen_txs.get(name, [])[-100:]
 
-            # ── POLYGON ──
-            elif network == "polygon":
-                for tx in await fetch_polygon_confirmed(address, session):
-                    txhash = tx.get("hash", "")
-                    if not txhash:
-                        continue
-                    if txhash in pending_txs:
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=format_confirmed_update(name, txhash,
-                                f"📋 <b>Onay:</b> {tx.get('confirmations','?')}\n"),
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=polygon_tx_keyboard(txhash),
-                            disable_web_page_preview=True,
-                        )
-                        del pending_txs[txhash]
-                    elif txhash not in seen_txs.get(name, []):
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=format_polygon_tx(name, address, tx),
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=polygon_tx_keyboard(txhash),
-                            disable_web_page_preview=True,
-                        )
-                        seen_txs.setdefault(name, []).append(txhash)
-                        daily_txs[name].append({"txid": txhash, "type": "polygon_usdt", "raw": tx, "address": address})
+        # ── POLYGON ──
+        elif network == "polygon":
+            for tx in await fetch_polygon_confirmed(address, session):
+                txhash = tx.get("hash", "")
+                if not txhash:
+                    continue
+                if txhash in pending_txs:
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=format_confirmed_update(name, txhash,
+                            f"📋 <b>Onay:</b> {tx.get('confirmations','?')}\n"),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=polygon_tx_keyboard(txhash),
+                        disable_web_page_preview=True,
+                    )
+                    del pending_txs[txhash]
+                elif txhash not in seen_txs.get(name, []):
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=format_polygon_tx(name, address, tx),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=polygon_tx_keyboard(txhash),
+                        disable_web_page_preview=True,
+                    )
+                    seen_txs.setdefault(name, []).append(txhash)
+                    daily_txs[name].append(_summarize_polygon(tx, address))
 
-                seen_txs[name] = seen_txs.get(name, [])[-100:]
+            seen_txs[name] = seen_txs.get(name, [])[-100:]
 
     save_json(STATE_FILE, seen_txs)
     save_json(PENDING_FILE, pending_txs)
@@ -409,32 +440,32 @@ async def check_wallets(bot: Bot):
 # ──────────────────────────────────────────────────────
 async def _bakiye_data():
     lines = [f"💼 <b>Cuzdan Bakiyeleri</b>\n🕐 {now_str()}\n══════════════════════════════"]
-    async with aiohttp.ClientSession() as session:
-        for name, cfg in WALLETS.items():
-            address = cfg["address"]
-            if cfg["network"] == "btc":
-                info = await fetch_btc_address_info(address, session)
-                if info:
-                    funded  = info.get("chain_stats", {}).get("funded_txo_sum", 0)
-                    spent   = info.get("chain_stats", {}).get("spent_txo_sum", 0)
-                    balance = (funded - spent) / 1e8
-                    mem     = info.get("mempool_stats", {})
-                    unconf  = (mem.get("funded_txo_sum", 0) - mem.get("spent_txo_sum", 0)) / 1e8
-                    lines.append(
-                        f"\n👛 <b>{e(name)}</b>\n"
-                        f"  💰 Bakiye: <code>{balance:.8f} BTC</code>\n"
-                        f"  ⏳ Bekleyen: <code>{unconf:+.8f} BTC</code>\n"
-                        f"  📍 <code>{e(address[:20])}...</code>"
-                    )
-                else:
-                    lines.append(f"\n👛 <b>{e(name)}</b>\n  ❌ Bakiye alinamadi.")
-            elif cfg["network"] == "polygon":
-                balance = await fetch_polygon_usdt_balance(address, session)
+    session = HTTP_SESSION
+    for name, cfg in WALLETS.items():
+        address = cfg["address"]
+        if cfg["network"] == "btc":
+            info = await fetch_btc_address_info(address, session)
+            if info:
+                funded  = info.get("chain_stats", {}).get("funded_txo_sum", 0)
+                spent   = info.get("chain_stats", {}).get("spent_txo_sum", 0)
+                balance = (funded - spent) / 1e8
+                mem     = info.get("mempool_stats", {})
+                unconf  = (mem.get("funded_txo_sum", 0) - mem.get("spent_txo_sum", 0)) / 1e8
                 lines.append(
                     f"\n👛 <b>{e(name)}</b>\n"
-                    f"  💰 Bakiye: <code>{balance:.2f} USDT</code>\n"
+                    f"  💰 Bakiye: <code>{balance:.8f} BTC</code>\n"
+                    f"  ⏳ Bekleyen: <code>{unconf:+.8f} BTC</code>\n"
                     f"  📍 <code>{e(address[:20])}...</code>"
                 )
+            else:
+                lines.append(f"\n👛 <b>{e(name)}</b>\n  ❌ Bakiye alinamadi.")
+        elif cfg["network"] == "polygon":
+            balance = await fetch_polygon_usdt_balance(address, session)
+            lines.append(
+                f"\n👛 <b>{e(name)}</b>\n"
+                f"  💰 Bakiye: <code>{balance:.2f} USDT</code>\n"
+                f"  📍 <code>{e(address[:20])}...</code>"
+            )
     lines.append("\n══════════════════════════════")
     return "\n".join(lines)
 
@@ -446,26 +477,20 @@ async def _rapor_text():
     ]
     has_data = False
     for name, cfg in WALLETS.items():
-        txs = daily_txs.get(name, [])
+        entries = daily_txs.get(name, [])
         total_in = total_out = 0.0
-        for entry in txs:
-            raw, address = entry["raw"], entry["address"]
-            if entry["type"] == "btc":
-                vout  = raw.get("vout", [])
-                val   = sum(o.get("value", 0) for o in vout if o.get("scriptpubkey_address") == address) / 1e8
-                is_in = any(o.get("scriptpubkey_address") == address for o in vout)
+        for entry in entries:
+            if entry["is_in"]:
+                total_in  += entry["amount"]
             else:
-                val   = int(raw.get("value", 0)) / 1e6
-                is_in = raw.get("to", "").lower() == address.lower()
-            if is_in: total_in  += val
-            else:     total_out += val
-        if txs:
+                total_out += entry["amount"]
+        if entries:
             has_data = True
         lines.append(
             f"\n👛 <b>{e(name)}</b>\n"
             f"  📥 Giris: <code>{total_in:.6f} {cfg['symbol']}</code>\n"
             f"  📤 Cikis: <code>{total_out:.6f} {cfg['symbol']}</code>\n"
-            f"  🔢 Islem: <code>{len(txs)} adet</code>"
+            f"  🔢 Islem: <code>{len(entries)} adet</code>"
         )
     if not has_data:
         lines.append("\n✨ Bugun hic islem gerceklesmedi.")
@@ -475,52 +500,52 @@ async def _rapor_text():
 async def _sonislem_data():
     lines = [f"🔎 <b>Son Islemler</b>\n🕐 {now_str()}\n══════════════════════════════"]
     last_txhash = last_txid = last_network = None
+    session = HTTP_SESSION
 
-    async with aiohttp.ClientSession() as session:
-        for name, cfg in WALLETS.items():
-            address = cfg["address"]
-            lines.append(f"\n👛 <b>{e(name)}</b>")
+    for name, cfg in WALLETS.items():
+        address = cfg["address"]
+        lines.append(f"\n👛 <b>{e(name)}</b>")
 
-            if cfg["network"] == "btc":
-                txs = await fetch_btc_txs(address, session)
-                if txs:
-                    tx        = txs[0]
-                    txid      = tx["txid"]
-                    vout      = tx.get("vout", [])
-                    status    = tx.get("status", {})
-                    is_in     = any(o.get("scriptpubkey_address") == address for o in vout)
-                    amount    = sum(o.get("value", 0) for o in vout if o.get("scriptpubkey_address") == address) / 1e8
-                    icon      = "📥" if is_in else "📤"
-                    conf_str  = "✅ Onayli" if status.get("confirmed") else "⏳ Pending"
-                    lines.append(
-                        f"  {icon} <code>{amount:.8f} BTC</code>\n"
-                        f"  📋 {conf_str}\n"
-                        f"  🕐 {ts_to_str(status.get('block_time'))}\n"
-                        f'  <a href="https://blockstream.info/tx/{txid}">TX Goruntule</a>'
-                    )
-                    last_txid    = txid
-                    last_network = "btc"
-                else:
-                    lines.append("  Hic islem bulunamadi.")
+        if cfg["network"] == "btc":
+            txs = await fetch_btc_txs(address, session)
+            if txs:
+                tx        = txs[0]
+                txid      = tx["txid"]
+                vout      = tx.get("vout", [])
+                status    = tx.get("status", {})
+                is_in     = any(o.get("scriptpubkey_address") == address for o in vout)
+                amount    = sum(o.get("value", 0) for o in vout if o.get("scriptpubkey_address") == address) / 1e8
+                icon      = "📥" if is_in else "📤"
+                conf_str  = "✅ Onayli" if status.get("confirmed") else "⏳ Pending"
+                lines.append(
+                    f"  {icon} <code>{amount:.8f} BTC</code>\n"
+                    f"  📋 {conf_str}\n"
+                    f"  🕐 {ts_to_str(status.get('block_time'))}\n"
+                    f'  <a href="https://blockstream.info/tx/{txid}">TX Goruntule</a>'
+                )
+                last_txid    = txid
+                last_network = "btc"
+            else:
+                lines.append("  Hic islem bulunamadi.")
 
-            elif cfg["network"] == "polygon":
-                txs = await fetch_polygon_confirmed(address, session, offset=1)
-                if txs:
-                    tx     = txs[0]
-                    txhash = tx.get("hash", "")
-                    value  = int(tx.get("value", 0)) / 1e6
-                    is_in  = tx.get("to", "").lower() == address.lower()
-                    icon   = "📥" if is_in else "📤"
-                    lines.append(
-                        f"  {icon} <code>{value:.2f} USDT</code>\n"
-                        f"  📋 {tx.get('confirmations','?')} onay ✅\n"
-                        f"  🕐 {ts_to_str(tx.get('timeStamp'))}\n"
-                        f'  <a href="https://polygonscan.com/tx/{txhash}">TX Goruntule</a>'
-                    )
-                    last_txhash  = txhash
-                    last_network = "polygon"
-                else:
-                    lines.append("  Hic islem bulunamadi.")
+        elif cfg["network"] == "polygon":
+            txs = await fetch_polygon_confirmed(address, session, offset=1)
+            if txs:
+                tx     = txs[0]
+                txhash = tx.get("hash", "")
+                value  = int(tx.get("value", 0)) / 1e6
+                is_in  = tx.get("to", "").lower() == address.lower()
+                icon   = "📥" if is_in else "📤"
+                lines.append(
+                    f"  {icon} <code>{value:.2f} USDT</code>\n"
+                    f"  📋 {tx.get('confirmations','?')} onay ✅\n"
+                    f"  🕐 {ts_to_str(tx.get('timeStamp'))}\n"
+                    f'  <a href="https://polygonscan.com/tx/{txhash}">TX Goruntule</a>'
+                )
+                last_txhash  = txhash
+                last_network = "polygon"
+            else:
+                lines.append("  Hic islem bulunamadi.")
 
     lines.append("\n══════════════════════════════")
     if last_network == "btc" and last_txid:
@@ -668,65 +693,75 @@ async def send_daily_report(bot: Bot):
 # ANA FONKSİYON
 # ──────────────────────────────────────────────────────
 async def main():
-    await initialize_snapshots()
+    global HTTP_SESSION
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("yardim",        cmd_yardim))
-    app.add_handler(CommandHandler("saat",          cmd_saat))
-    app.add_handler(CommandHandler("rapor",         cmd_rapor))
-    app.add_handler(CommandHandler("sonislem",      cmd_sonislem))
-    app.add_handler(CommandHandler("bakiye",        cmd_bakiye))
-    app.add_handler(CommandHandler("bekleyenler",   cmd_bekleyenler))
-    app.add_handler(CommandHandler("sistemkontrol", cmd_sistemkontrol))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-
-    await app.bot.set_my_commands([
-        BotCommand("rapor",         "Bugunun ozet raporu"),
-        BotCommand("sonislem",      "Her cuzdanin son islemi"),
-        BotCommand("bakiye",        "Tum cuzdan bakiyeleri"),
-        BotCommand("saat",          "Simdi saat kac (TR)"),
-        BotCommand("bekleyenler",   "Pending islemler"),
-        BotCommand("sistemkontrol", "Bot durumu ve istatistik"),
-        BotCommand("yardim",        "Komut listesi"),
-    ])
-
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(check_wallets, "interval", seconds=CHECK_INTERVAL_SECONDS,
-                      args=[app.bot], id="check_wallets", max_instances=1)
-    scheduler.add_job(send_daily_report, "cron",
-                      hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE,
-                      args=[app.bot], id="daily_report")
-    scheduler.start()
-
-    await app.bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=(
-            "✅ <b>Cuzdan Takip Botu Basladi!</b>\n\n"
-            f"🔍 Takip: {len(WALLETS)} cuzdan\n"
-            f"⏱ Kontrol: {CHECK_INTERVAL_SECONDS} saniye\n"
-            f"📊 Gunluk ozet: {DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d} UTC\n\n"
-            "Komutlar icin /yardim yaz."
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(),
-    )
-
-    log.info("Bot calisiyor...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
+    # Tek paylasimli session - baglanti sayisi sinirli tutularak bellek
+    # kullanimini dusuruyoruz (islev/veri kaybi yok, sadece havuz kucultuluyor).
+    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+    HTTP_SESSION = aiohttp.ClientSession(connector=connector)
 
     try:
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, SystemExit):
-        pass
+        await initialize_snapshots()
+
+        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start",         cmd_start))
+        app.add_handler(CommandHandler("yardim",        cmd_yardim))
+        app.add_handler(CommandHandler("saat",          cmd_saat))
+        app.add_handler(CommandHandler("rapor",         cmd_rapor))
+        app.add_handler(CommandHandler("sonislem",      cmd_sonislem))
+        app.add_handler(CommandHandler("bakiye",        cmd_bakiye))
+        app.add_handler(CommandHandler("bekleyenler",   cmd_bekleyenler))
+        app.add_handler(CommandHandler("sistemkontrol", cmd_sistemkontrol))
+        app.add_handler(CallbackQueryHandler(callback_handler))
+
+        await app.bot.set_my_commands([
+            BotCommand("rapor",         "Bugunun ozet raporu"),
+            BotCommand("sonislem",      "Her cuzdanin son islemi"),
+            BotCommand("bakiye",        "Tum cuzdan bakiyeleri"),
+            BotCommand("saat",          "Simdi saat kac (TR)"),
+            BotCommand("bekleyenler",   "Pending islemler"),
+            BotCommand("sistemkontrol", "Bot durumu ve istatistik"),
+            BotCommand("yardim",        "Komut listesi"),
+        ])
+
+        scheduler = AsyncIOScheduler(timezone="UTC")
+        scheduler.add_job(check_wallets, "interval", seconds=CHECK_INTERVAL_SECONDS,
+                          args=[app.bot], id="check_wallets", max_instances=1)
+        scheduler.add_job(send_daily_report, "cron",
+                          hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE,
+                          args=[app.bot], id="daily_report")
+        scheduler.start()
+
+        await app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=(
+                "✅ <b>Cuzdan Takip Botu Basladi!</b>\n\n"
+                f"🔍 Takip: {len(WALLETS)} cuzdan\n"
+                f"⏱ Kontrol: {CHECK_INTERVAL_SECONDS} saniye\n"
+                f"📊 Gunluk ozet: {DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d} UTC\n\n"
+                "Komutlar icin /yardim yaz."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(),
+        )
+
+        log.info("Bot calisiyor...")
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        try:
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            log.info("Bot durduruldu.")
+            scheduler.shutdown(wait=False)
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
     finally:
-        log.info("Bot durduruldu.")
-        scheduler.shutdown(wait=False)
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        await HTTP_SESSION.close()
 
 
 if __name__ == "__main__":
