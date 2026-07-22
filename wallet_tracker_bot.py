@@ -34,26 +34,14 @@ from telegram.constants import ParseMode
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "8649558470:AAHCRXTKxCiVi2MaAp88trJVe7McE8v7j9k")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "492272237")
 
+# Su an sadece tek bir BTC cuzdani takip ediliyor.
+# Polygon/BTC ile ilgili tum fonksiyonlar (bakiye, tx cekme, formatlama vs.)
+# oldugu gibi duruyor; sadece WALLETS listesi tek girdiye indirildi.
 WALLETS = {
-    "bc1qx37z09wa8uw0r9s9rhkg24a9zl88p92qn8reqq": {
-        "address": "bc1qx37z09wa8uw0r9s9rhkg24a9zl88p92qn8reqq",
+    "bc1q8860rzqjfh0pxr85nc6ld7h6ltrmcm7rqsn4mv": {
+        "address": "bc1q8860rzqjfh0pxr85nc6ld7h6ltrmcm7rqsn4mv",
         "network": "btc",
         "symbol":  "BTC",
-    },
-    "bc1qpxq2asrywmtvct6ecs2yawx97n4lymjl82ampk": {
-        "address": "bc1qpxq2asrywmtvct6ecs2yawx97n4lymjl82ampk",
-        "network": "btc",
-        "symbol":  "BTC",
-    },
-    "0x51126d2EFD5bbD63A97b01B5e40464da1547962B": {
-        "address": "0x51126d2EFD5bbD63A97b01B5e40464da1547962B",
-        "network": "polygon",
-        "symbol":  "USDT",
-    },
-    "0xA6846f4b81025adCBe00dAde4daeEdc3C3E0aD14": {
-        "address": "0xA6846f4b81025adCBe00dAde4daeEdc3C3E0aD14",
-        "network": "polygon",
-        "symbol":  "USDT",
     },
 }
 
