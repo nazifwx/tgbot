@@ -2,6 +2,7 @@
 Telegram Cuzdan Takip Botu
 - 2x BTC cüzdanı (mempool + confirmed)
 - 2x Polygon USDT (30sn polling — blok süresi 2sn olduğu için yeterli)
+- 2x Solana USDT / SPL (30sn polling — RPC ile confirmed islemler)
 - Inline butonlar
 - Günlük özet raporu
 - /komutlar desteği
@@ -11,9 +12,15 @@ RAM OPTIMIZASYONLARI (islev kaybi olmadan):
      Eskiden her kontrol dongusunde / her komutta yeni bir session acilip
      kapatiliyordu (yeni connector havuzu = fazladan bellek + GC yuku).
   2) daily_txs artik ham (raw) API cevabini degil, sadece rapor icin
-     gereken minimal alanlari (miktar, yon, tip) saklar. BTC/Polygon ham
-     JSON'lari (vin/vout, gas bilgisi, log index vs.) gun icinde onlarca
-     islem biriktiginde gereksiz yere bellek tuketiyordu.
+     gereken minimal alanlari (miktar, yon, tip) saklar. BTC/Polygon/Solana
+     ham JSON'lari (vin/vout, gas bilgisi, log index, pre/postTokenBalances vs.)
+     gun icinde onlarca islem biriktiginde gereksiz yere bellek tuketiyordu.
+
+SOLANA NOTU:
+  Varsayilan olarak public Solana RPC (api.mainnet-beta.solana.com) kullanilir.
+  Bu endpoint sik sik rate-limit (429) doner. Kararli calisma icin ucretsiz/
+  ucretli ozel bir RPC saglayicisi (Helius, QuickNode, Alchemy vb.) onerilir;
+  SOLANA_RPC_URL ortam degiskeniyle degistirilebilir.
 """
 
 import asyncio
@@ -34,19 +41,34 @@ from telegram.constants import ParseMode
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "8649558470:AAHCRXTKxCiVi2MaAp88trJVe7McE8v7j9k")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "492272237")
 
-# Su an sadece tek bir BTC cuzdani takip ediliyor.
-# Polygon/BTC ile ilgili tum fonksiyonlar (bakiye, tx cekme, formatlama vs.)
-# oldugu gibi duruyor; sadece WALLETS listesi tek girdiye indirildi.
+# Takip edilen cuzdanlar. BTC, Polygon USDT ve Solana USDT (SPL) karisik
+# olarak eklenebilir; her girdi kendi "network" alanina gore islenir.
 WALLETS = {
     "bc1q8860rzqjfh0pxr85nc6ld7h6ltrmcm7rqsn4mv": {
         "address": "bc1q8860rzqjfh0pxr85nc6ld7h6ltrmcm7rqsn4mv",
         "network": "btc",
         "symbol":  "BTC",
     },
+    "Solana Cuzdan 1": {
+        "address": "CAtQFDHEgH2s8k2UANQVvJFc5oWREGfoSWZkgq1juudZ",
+        "network": "solana",
+        "symbol":  "USDT",
+    },
+    "Solana Cuzdan 2": {
+        "address": "6ZusgXdQDNvRiqzqJ1mj7xsRCcAnLGzNgyB7weWVUb2F",
+        "network": "solana",
+        "symbol":  "USDT",
+    },
 }
 
 USDT_CONTRACT          = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
 POLYGONSCAN_API_KEY    = os.getenv("POLYGONSCAN_API_KEY", "RGSD69N6JG2KM9IIMJME2G8W8Y9N6FX6JY")
+
+# Solana USDT (SPL Token) mint adresi
+USDT_SOLANA_MINT   = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+SOLANA_RPC_URL     = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+SOLANA_TX_LIMIT    = 15   # her kontrol dongusunde token hesabi icin cekilecek son islem sayisi
+
 DAILY_REPORT_HOUR      = 20   # UTC
 DAILY_REPORT_MINUTE    = 0
 CHECK_INTERVAL_SECONDS = 30
@@ -78,6 +100,10 @@ seen_txs    = load_json(STATE_FILE)
 pending_txs = load_json(PENDING_FILE)
 # Artik ham tx degil, minimal ozet dict tutuluyor: {"type":..,"amount":..,"is_in":..,"symbol":..}
 daily_txs   = {name: [] for name in WALLETS}
+
+# Solana icin: sahibin (owner) USDT associated token account (ATA) adresini
+# her seferinde RPC'den sormamak icin basit bir cache. {owner_address: token_account | None}
+solana_token_account_cache: dict[str, str | None] = {}
 
 # Tum HTTP cagrilari icin tek paylasimli session (main() icinde olusturulur)
 HTTP_SESSION: aiohttp.ClientSession | None = None
@@ -116,6 +142,18 @@ def polygon_tx_keyboard(txhash):
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🔍 Polygonscan'da Gör", url=f"https://polygonscan.com/tx/{txhash}"),
+        ],
+        [
+            InlineKeyboardButton("💼 Bakiyeler", callback_data="bakiye"),
+            InlineKeyboardButton("📊 Rapor", callback_data="rapor"),
+        ],
+    ])
+
+def solana_tx_keyboard(signature):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔍 Solscan'da Gör", url=f"https://solscan.io/tx/{signature}"),
+            InlineKeyboardButton("🌐 Solana FM", url=f"https://solana.fm/tx/{signature}"),
         ],
         [
             InlineKeyboardButton("💼 Bakiyeler", callback_data="bakiye"),
@@ -219,6 +257,111 @@ async def fetch_polygon_usdt_balance(address, session):
         log.warning(f"Polygon balance API hatasi: {ex}")
     return 0.0
 
+# ── SOLANA ──
+async def _solana_rpc(method, params, session):
+    """Solana JSON-RPC istegi atar, 'result' alanini dondurur (hata olursa None)."""
+    try:
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        async with session.post(
+            SOLANA_RPC_URL, json=payload,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            data = await r.json()
+            if "error" in data:
+                log.warning(f"Solana RPC hatasi ({method}): {data['error']}")
+                return None
+            return data.get("result")
+    except Exception as ex:
+        log.warning(f"Solana RPC istek hatasi ({method}): {ex}")
+        return None
+
+async def fetch_solana_usdt_account(owner, session, use_cache=True):
+    """
+    Owner'in USDT (SPL) token hesabini bulur.
+    Donus: (token_account_pubkey_or_None, ui_balance_float)
+    """
+    if use_cache and owner in solana_token_account_cache and solana_token_account_cache[owner]:
+        token_account = solana_token_account_cache[owner]
+        # Cache'de adres var, sadece guncel bakiyeyi cekmek icin getTokenAccountBalance kullan
+        result = await _solana_rpc("getTokenAccountBalance", [token_account], session)
+        if result:
+            balance = float(result.get("value", {}).get("uiAmount") or 0)
+            return token_account, balance
+        # Cache gecersiz kaldiysa asagida yeniden arayacagiz
+
+    result = await _solana_rpc(
+        "getTokenAccountsByOwner",
+        [owner, {"mint": USDT_SOLANA_MINT}, {"encoding": "jsonParsed"}],
+        session,
+    )
+    if not result:
+        return None, 0.0
+    accounts = result.get("value", [])
+    if not accounts:
+        solana_token_account_cache[owner] = None
+        return None, 0.0
+
+    acc = accounts[0]
+    token_account = acc.get("pubkey")
+    try:
+        amount_info = acc["account"]["data"]["parsed"]["info"]["tokenAmount"]
+        balance = float(amount_info.get("uiAmount") or 0)
+    except (KeyError, TypeError):
+        balance = 0.0
+
+    solana_token_account_cache[owner] = token_account
+    return token_account, balance
+
+async def fetch_solana_signatures(token_account, session, limit=SOLANA_TX_LIMIT):
+    result = await _solana_rpc(
+        "getSignaturesForAddress",
+        [token_account, {"limit": limit}],
+        session,
+    )
+    return result or []
+
+async def fetch_solana_tx(signature, session):
+    return await _solana_rpc(
+        "getTransaction",
+        [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+        session,
+    )
+
+def _solana_tx_delta(tx, owner):
+    """
+    Verilen tx'in meta.pre/postTokenBalances alanlarindan, 'owner' sahibinin
+    USDT bakiyesindeki degisimi hesaplar.
+    Donus: (amount, is_in) veya alakasiz/parse edilemezse None.
+    """
+    if not tx:
+        return None
+    meta = tx.get("meta") or {}
+    pre  = meta.get("preTokenBalances") or []
+    post = meta.get("postTokenBalances") or []
+
+    pre_map  = {b["accountIndex"]: b for b in pre  if b.get("mint") == USDT_SOLANA_MINT}
+    post_map = {b["accountIndex"]: b for b in post if b.get("mint") == USDT_SOLANA_MINT}
+
+    # Hesap hala aciksa (postTokenBalances icinde var)
+    for idx, pb in post_map.items():
+        if pb.get("owner") != owner:
+            continue
+        pre_amt  = float((pre_map.get(idx, {}).get("uiTokenAmount") or {}).get("uiAmount") or 0)
+        post_amt = float((pb.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+        delta = post_amt - pre_amt
+        if delta != 0:
+            return abs(delta), delta > 0
+
+    # Hesap bu islemde kapatildiysa (sadece preTokenBalances icinde var)
+    for idx, pb in pre_map.items():
+        if pb.get("owner") != owner or idx in post_map:
+            continue
+        pre_amt = float((pb.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+        if pre_amt != 0:
+            return pre_amt, False
+
+    return None
+
 # ──────────────────────────────────────────────────────
 # MESAJ FORMATLAMA
 # ──────────────────────────────────────────────────────
@@ -290,6 +433,20 @@ def format_polygon_tx(wallet_name, address, tx, is_pending=False):
         f"🔑 <b>TX:</b> <code>{e(txhash)}</code>"
     )
 
+def format_solana_tx(wallet_name, signature, amount, is_in, block_time):
+    dir_icon  = "📥" if is_in else "📤"
+    direction = "GIRIS" if is_in else "CIKIS"
+    return (
+        "🔔 <b>Yeni Solana USDT Islemi!</b>\n"
+        f"👛 <b>Cuzdan:</b> {e(wallet_name)}\n"
+        "────────────────────────────\n"
+        f"{dir_icon} <b>Yon:</b> {direction}\n"
+        f"💰 <b>Miktar:</b> <code>{amount:.6f} USDT</code>\n"
+        f"📋 <b>Durum:</b> Onaylandi ✅\n"
+        f"🕐 <b>Zaman:</b> {e(ts_to_str(block_time))}\n"
+        f"🔑 <b>TX:</b> <code>{e(signature[:20])}...</code>"
+    )
+
 def format_confirmed_update(wallet_name, txid, extra=""):
     return (
         f"✅ <b>Islem Onaylandi!</b>\n"
@@ -314,6 +471,11 @@ async def initialize_snapshots():
         elif cfg["network"] == "polygon":
             txs = await fetch_polygon_confirmed(address, HTTP_SESSION)
             ids = [tx["hash"] for tx in txs[:20]]
+        elif cfg["network"] == "solana":
+            token_account, _ = await fetch_solana_usdt_account(address, HTTP_SESSION, use_cache=False)
+            if token_account:
+                sigs = await fetch_solana_signatures(token_account, HTTP_SESSION, limit=25)
+                ids  = [s["signature"] for s in sigs]
 
         if name not in seen_txs:
             seen_txs[name] = ids
@@ -338,6 +500,9 @@ def _summarize_polygon(tx, address):
     amount = int(tx.get("value", 0)) / 1e6
     is_in  = tx.get("to", "").lower() == address.lower()
     return {"type": "polygon_usdt", "amount": amount, "is_in": is_in}
+
+def _summarize_solana(amount, is_in):
+    return {"type": "solana_usdt", "amount": amount, "is_in": is_in}
 
 # ──────────────────────────────────────────────────────
 # ANA KONTROL DÖNGÜSÜ
@@ -420,6 +585,44 @@ async def check_wallets(bot: Bot):
 
             seen_txs[name] = seen_txs.get(name, [])[-100:]
 
+        # ── SOLANA ──
+        elif network == "solana":
+            token_account, _bal = await fetch_solana_usdt_account(address, session)
+            if not token_account:
+                continue  # bu owner'in henuz USDT token hesabi yok
+
+            sigs = await fetch_solana_signatures(token_account, session, limit=SOLANA_TX_LIMIT)
+            # En eskiden en yeniye dogru isle, boylece chat'e dogru sirayla dusuyor
+            for s in reversed(sigs):
+                sig = s.get("signature")
+                if not sig or sig in seen_txs.get(name, []):
+                    continue
+
+                seen_txs.setdefault(name, []).append(sig)
+
+                if s.get("err"):
+                    # Basarisiz islem, bildirim gonderme ama gorulmus say
+                    continue
+
+                tx = await fetch_solana_tx(sig, session)
+                delta = _solana_tx_delta(tx, address)
+                if not delta:
+                    continue  # USDT ile ilgisiz veya parse edilemedi
+
+                amount, is_in = delta
+                block_time = (tx.get("blockTime") if tx else None) or s.get("blockTime")
+
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=format_solana_tx(name, sig, amount, is_in, block_time),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=solana_tx_keyboard(sig),
+                    disable_web_page_preview=True,
+                )
+                daily_txs[name].append(_summarize_solana(amount, is_in))
+
+            seen_txs[name] = seen_txs.get(name, [])[-100:]
+
     save_json(STATE_FILE, seen_txs)
     save_json(PENDING_FILE, pending_txs)
 
@@ -452,6 +655,13 @@ async def _bakiye_data():
             lines.append(
                 f"\n👛 <b>{e(name)}</b>\n"
                 f"  💰 Bakiye: <code>{balance:.2f} USDT</code>\n"
+                f"  📍 <code>{e(address[:20])}...</code>"
+            )
+        elif cfg["network"] == "solana":
+            _, balance = await fetch_solana_usdt_account(address, session)
+            lines.append(
+                f"\n👛 <b>{e(name)}</b>\n"
+                f"  💰 Bakiye: <code>{balance:.6f} USDT</code>\n"
                 f"  📍 <code>{e(address[:20])}...</code>"
             )
     lines.append("\n══════════════════════════════")
@@ -487,7 +697,7 @@ async def _rapor_text():
 
 async def _sonislem_data():
     lines = [f"🔎 <b>Son Islemler</b>\n🕐 {now_str()}\n══════════════════════════════"]
-    last_txhash = last_txid = last_network = None
+    last_txhash = last_txid = last_signature = last_network = None
     session = HTTP_SESSION
 
     for name, cfg in WALLETS.items():
@@ -535,11 +745,43 @@ async def _sonislem_data():
             else:
                 lines.append("  Hic islem bulunamadi.")
 
+        elif cfg["network"] == "solana":
+            token_account, _bal = await fetch_solana_usdt_account(address, session)
+            sig = None
+            if token_account:
+                sigs = await fetch_solana_signatures(token_account, session, limit=1)
+                if sigs:
+                    sig_info = sigs[0]
+                    sig = sig_info.get("signature")
+                    tx  = await fetch_solana_tx(sig, session)
+                    delta = _solana_tx_delta(tx, address)
+                    block_time = (tx.get("blockTime") if tx else None) or sig_info.get("blockTime")
+                    if delta:
+                        amount, is_in = delta
+                        icon = "📥" if is_in else "📤"
+                        lines.append(
+                            f"  {icon} <code>{amount:.6f} USDT</code>\n"
+                            f"  📋 Onayli ✅\n"
+                            f"  🕐 {ts_to_str(block_time)}\n"
+                            f'  <a href="https://solscan.io/tx/{sig}">TX Goruntule</a>'
+                        )
+                    else:
+                        lines.append("  ℹ️ Son islem USDT transferi degil / parse edilemedi.")
+            if sig:
+                last_signature = sig
+                last_network   = "solana"
+            elif not token_account:
+                lines.append("  Bu adres icin henuz USDT token hesabi yok.")
+            elif not sig:
+                lines.append("  Hic islem bulunamadi.")
+
     lines.append("\n══════════════════════════════")
     if last_network == "btc" and last_txid:
         keyboard = btc_tx_keyboard(last_txid)
     elif last_network == "polygon" and last_txhash:
         keyboard = polygon_tx_keyboard(last_txhash)
+    elif last_network == "solana" and last_signature:
+        keyboard = solana_tx_keyboard(last_signature)
     else:
         keyboard = main_menu_keyboard()
     return "\n".join(lines), keyboard
@@ -579,8 +821,9 @@ def _sistemkontrol_text():
         f"📈 <b>Bugunun islemi:</b> <code>{sum(len(v) for v in daily_txs.values())}</code>",
         "",
     ]
+    net_label = {"btc": "BTC", "polygon": "Polygon", "solana": "Solana"}
     for name, cfg in WALLETS.items():
-        net = "BTC" if cfg["network"] == "btc" else "Polygon"
+        net = net_label.get(cfg["network"], cfg["network"])
         lines.append(f"  ✅ {e(name)} ({net})")
     lines += ["══════════════════════════════", "<i>Tum sistemler calisiyor.</i>"]
     return "\n".join(lines)
