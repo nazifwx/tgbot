@@ -44,8 +44,13 @@ TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "492272237")
 # Takip edilen cuzdanlar. BTC, Polygon USDT ve Solana USDT (SPL) karisik
 # olarak eklenebilir; her girdi kendi "network" alanina gore islenir.
 WALLETS = {
-    "bc1q8860rzqjfh0pxr85nc6ld7h6ltrmcm7rqsn4mv": {
-        "address": "bc1q8860rzqjfh0pxr85nc6ld7h6ltrmcm7rqsn4mv",
+  "bc1qaypf47jrtq4tvlsj0d9eqz4lw3xjc8leu5zx8w": {
+        "address": "bc1qaypf47jrtq4tvlsj0d9eqz4lw3xjc8leu5zx8w",
+        "network": "btc",
+        "symbol":  "BTC",
+    },
+    "bc1q92phujf7espscvqymt2spy2427wmkgdza9h66t": {
+        "address": "bc1q92phujf7espscvqymt2spy2427wmkgdza9h66t",
         "network": "btc",
         "symbol":  "BTC",
     },
