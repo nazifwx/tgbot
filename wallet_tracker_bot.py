@@ -44,40 +44,15 @@ TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "492272237")
 # Takip edilen cuzdanlar. BTC, Polygon USDT ve Solana USDT (SPL) karisik
 # olarak eklenebilir; her girdi kendi "network" alanina gore islenir.
 WALLETS = {
-  "bc1qau9pnzewpgqxe8ryq79kypujsmnxakn55fqytw": {
+    "bc1qau9pnzewpgqxe8ryq79kypujsmnxakn55fqytw": {
         "address": "bc1qau9pnzewpgqxe8ryq79kypujsmnxakn55fqytw",
         "network": "btc",
         "symbol":  "BTC",
     },
-  "bc1qqadxds4nm57v0hcj490yz6ac9s77ku6h2haxax": {
+    "bc1qqadxds4nm57v0hcj490yz6ac9s77ku6h2haxax": {
         "address": "bc1qqadxds4nm57v0hcj490yz6ac9s77ku6h2haxax",
         "network": "btc",
         "symbol":  "BTC",
-    },
-  "bc1qjdcmnchmf68skzzwuxpwghg27x550nft7tc50p": {
-        "address": "bc1qjdcmnchmf68skzzwuxpwghg27x550nft7tc50p",
-        "network": "btc",
-        "symbol":  "BTC",
-    },
-  "bc1qn6e9ez2ru79zt4f835rxuhzgnudf65w05z2zqf": {
-        "address": "bc1qn6e9ez2ru79zt4f835rxuhzgnudf65w05z2zqf",
-        "network": "btc",
-        "symbol":  "BTC",
-    },
-  "bc1qaypf47jrtq4tvlsj0d9eqz4lw3xjc8leu5zx8w": {
-        "address": "bc1qaypf47jrtq4tvlsj0d9eqz4lw3xjc8leu5zx8w",
-        "network": "btc",
-        "symbol":  "BTC",
-    },
-    "bc1q92phujf7espscvqymt2spy2427wmkgdza9h66t": {
-        "address": "bc1q92phujf7espscvqymt2spy2427wmkgdza9h66t",
-        "network": "btc",
-        "symbol":  "BTC",
-    },
-    "Solana Cuzdan 1": {
-        "address": "CAtQFDHEgH2s8k2UANQVvJFc5oWREGfoSWZkgq1juudZ",
-        "network": "solana",
-        "symbol":  "USDT",
     },
     "Solana Cuzdan 2": {
         "address": "6ZusgXdQDNvRiqzqJ1mj7xsRCcAnLGzNgyB7weWVUb2F",
