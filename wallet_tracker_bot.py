@@ -1,5 +1,5 @@
 """
-Telegram Cuzdan Takip Botu
+Telegram Cuzdan Takip Botun
 - 2x BTC cüzdanı (mempool + confirmed)
 - 2x Polygon USDT (30sn polling — blok süresi 2sn olduğu için yeterli)
 - 2x Solana USDT / SPL (30sn polling — RPC ile confirmed islemler)
