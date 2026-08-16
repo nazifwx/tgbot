@@ -1,20 +1,26 @@
 """
-Telegram Cuzdan Takip Botun
-- 2x BTC cüzdanı (mempool + confirmed)
-- 2x Polygon USDT (30sn polling — blok süresi 2sn olduğu için yeterli)
-- 2x Solana USDT / SPL (30sn polling — RPC ile confirmed islemler)
+Telegram Cuzdan Takip Botu
+- 2x BTC cuzdani (mempool + confirmed)
+- 1x Ethereum mainnet USDT (ERC-20) - 30sn polling
+- 1x Solana USDT / SPL - 30sn polling (RPC ile confirmed islemler)
 - Inline butonlar
-- Günlük özet raporu
-- /komutlar desteği
+- Gunluk ozet raporu
+- /komutlar destegi
 
 RAM OPTIMIZASYONLARI (islev kaybi olmadan):
   1) Tum HTTP istekleri icin tek, paylasimli aiohttp.ClientSession kullanilir.
-     Eskiden her kontrol dongusunde / her komutta yeni bir session acilip
+     Eskiden her kontrol donguusnde / her komutta yeni bir session acilip
      kapatiliyordu (yeni connector havuzu = fazladan bellek + GC yuku).
   2) daily_txs artik ham (raw) API cevabini degil, sadece rapor icin
-     gereken minimal alanlari (miktar, yon, tip) saklar. BTC/Polygon/Solana
+     gereken minimal alanlari (miktar, yon, tip) saklar. BTC/EVM/Solana
      ham JSON'lari (vin/vout, gas bilgisi, log index, pre/postTokenBalances vs.)
      gun icinde onlarca islem biriktiginde gereksiz yere bellek tuketiyordu.
+
+EVM (ETH / POLYGON) NOTU:
+  Ethereum ve Polygon USDT takibi ayni Etherscan v2 API'si uzerinden
+  yapilir (https://api.etherscan.io/v2/api), sadece "chainid" parametresi
+  degisir (Ethereum = 1, Polygon = 137). Ayni API anahtari her iki zincir
+  icin de gecerlidir.
 
 SOLANA NOTU:
   Varsayilan olarak public Solana RPC (api.mainnet-beta.solana.com) kullanilir.
@@ -27,6 +33,7 @@ import asyncio
 import logging
 import os
 import json
+import re
 import time
 import aiohttp
 from datetime import datetime, timezone, timedelta
@@ -38,40 +45,80 @@ from telegram.constants import ParseMode
 # ──────────────────────────────────────────────────────
 # AYARLAR
 # ──────────────────────────────────────────────────────
+# NOT: Bu degerler ortam degiskeni (env var) olarak verilmezse kod icindeki
+# varsayilanlar kullanilir. Bu anahtarlari bir yerde paylastiysaniz
+# (ornegin bu sohbette) guvenlik icin yenilemeniz (rotate) onerilir.
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "8649558470:AAHCRXTKxCiVi2MaAp88trJVe7McE8v7j9k")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "492272237")
 
-# Takip edilen cuzdanlar. BTC, Polygon USDT ve Solana USDT (SPL) karisik
-# olarak eklenebilir; her girdi kendi "network" alanina gore islenir.
+# Takip edilen cuzdanlar. BTC, EVM USDT (Ethereum/Polygon) ve Solana USDT (SPL)
+# karisik olarak eklenebilir; her girdi kendi "network" alanina gore islenir.
 WALLETS = {
-    "bc1qau9pnzewpgqxe8ryq79kypujsmnxakn55fqytw": {
-        "address": "bc1qau9pnzewpgqxe8ryq79kypujsmnxakn55fqytw",
+    "bc1q4uxrzj5kday3xtfz28ju6k4re8npa8jeaddmug": {
+        "address": "bc1q4uxrzj5kday3xtfz28ju6k4re8npa8jeaddmug",
         "network": "btc",
         "symbol":  "BTC",
     },
-    "bc1qqadxds4nm57v0hcj490yz6ac9s77ku6h2haxax": {
-        "address": "bc1qqadxds4nm57v0hcj490yz6ac9s77ku6h2haxax",
+    "bc1qyz28dm0vxt6jj7lu9f837570az4ewutzdrcq3q": {
+        "address": "bc1qyz28dm0vxt6jj7lu9f837570az4ewutzdrcq3q",
         "network": "btc",
         "symbol":  "BTC",
     },
-    "Solana Cuzdan 2": {
+    "Solana Cuzdan": {
         "address": "6ZusgXdQDNvRiqzqJ1mj7xsRCcAnLGzNgyB7weWVUb2F",
         "network": "solana",
         "symbol":  "USDT",
     },
+    "ETH Cuzdan": {
+        "address": "0xeE261990aaFFbe4d018B7ED71655b2A6B56C6770",
+        "network": "eth",
+        "symbol":  "USDT",
+    },
 }
 
-USDT_CONTRACT          = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
-POLYGONSCAN_API_KEY    = os.getenv("POLYGONSCAN_API_KEY", "RGSD69N6JG2KM9IIMJME2G8W8Y9N6FX6JY")
+# EVM (Ethereum / Polygon) USDT kontrat adresleri
+USDT_CONTRACT_ETH      = "0xdAC17F958D2ee523a2206206994597C13D831ec7"   # Ethereum mainnet USDT
+USDT_CONTRACT_POLYGON  = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"   # Polygon USDT (referans - su an takip edilmiyor)
+ETHERSCAN_API_KEY      = os.getenv("ETHERSCAN_API_KEY", os.getenv("POLYGONSCAN_API_KEY", "RGSD69N6JG2KM9IIMJME2G8W8Y9N6FX6JY"))
+
+# network adi -> (chainid, kontrat adresi, explorer adi, explorer tx URL taban)
+EVM_NETWORKS = {
+    "eth": {
+        "chainid":       1,
+        "contract":      USDT_CONTRACT_ETH,
+        "explorer_name": "Etherscan",
+        "explorer_url":  "https://etherscan.io/tx/",
+    },
+    "polygon": {
+        "chainid":       137,
+        "contract":      USDT_CONTRACT_POLYGON,
+        "explorer_name": "Polygonscan",
+        "explorer_url":  "https://polygonscan.com/tx/",
+    },
+}
 
 # Solana USDT (SPL Token) mint adresi
 USDT_SOLANA_MINT   = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 SOLANA_RPC_URL     = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-SOLANA_TX_LIMIT    = 15   # her kontrol dongusunde token hesabi icin cekilecek son islem sayisi
+SOLANA_TX_LIMIT    = 15   # her kontrol donguusnde token hesabi icin cekilecek son islem sayisi
 
 DAILY_REPORT_HOUR      = 20   # UTC
 DAILY_REPORT_MINUTE    = 0
 CHECK_INTERVAL_SECONDS = 30
+
+# ── nonlogs.io/reserves takibi ──
+# Bu sayfa icin resmi bir JSON API yok (nonlogs.io/api sadece markets/orderbook/order
+# endpointlerini sunuyor), o yuzden sayfa HTML'i cekilip parse edilir. Sayfaya asiri
+# yuk bindirmemek icin ayri ve daha seyrek bir kontrol araligi kullanilir.
+NONLOGS_RESERVES_URL          = "https://nonlogs.io/reserves"
+NONLOGS_CHECK_INTERVAL_SECONDS = 60
+NONLOGS_STATE_FILE            = "nonlogs_reserves.json"
+# Takip edilen varliklar: coin -> (sayfadaki baslik metni, sembol satiri, ondalik hassasiyet)
+NONLOGS_TRACKED_ASSETS = {
+    "BTC":  {"heading": "Bitcoin",    "symbol_line": "BTC BTC",    "unit": "BTC",  "decimals": 8},
+    "GRIN": {"heading": "Grin",       "symbol_line": "GRIN Grin",  "unit": "GRIN", "decimals": 8},
+    "USDT": {"heading": "Tether USD", "symbol_line": "USDT ETH",   "unit": "USDT", "decimals": 6},
+}
 
 BOT_START_TIME = time.time()
 
@@ -98,8 +145,11 @@ def save_json(path, data):
 
 seen_txs    = load_json(STATE_FILE)
 pending_txs = load_json(PENDING_FILE)
-# Artik ham tx degil, minimal ozet dict tutuluyor: {"type":..,"amount":..,"is_in":..,"symbol":..}
+# Artik ham tx degil, minimal ozet dict tutuluyor: {"type":..,"amount":..,"is_in":..}
 daily_txs   = {name: [] for name in WALLETS}
+
+# nonlogs.io/reserves icin son bilinen bakiyeler: {"BTC": 0.63005365, "GRIN": ..., "USDT": ...}
+nonlogs_reserves = load_json(NONLOGS_STATE_FILE)
 
 # Solana icin: sahibin (owner) USDT associated token account (ATA) adresini
 # her seferinde RPC'den sormamak icin basit bir cache. {owner_address: token_account | None}
@@ -138,10 +188,11 @@ def btc_tx_keyboard(txid):
         ],
     ])
 
-def polygon_tx_keyboard(txhash):
+def evm_tx_keyboard(txhash, network):
+    cfg = EVM_NETWORKS[network]
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔍 Polygonscan'da Gör", url=f"https://polygonscan.com/tx/{txhash}"),
+            InlineKeyboardButton(f"🔍 {cfg['explorer_name']}'da Gör", url=f"{cfg['explorer_url']}{txhash}"),
         ],
         [
             InlineKeyboardButton("💼 Bakiyeler", callback_data="bakiye"),
@@ -215,17 +266,19 @@ async def fetch_btc_address_info(address, session):
         log.warning(f"BTC address info hatasi: {ex}")
     return {}
 
-async def fetch_polygon_confirmed(address, session, offset=10):
+# ── EVM (Ethereum / Polygon) - Etherscan v2 unified API ──
+async def fetch_evm_confirmed(address, session, network, offset=10):
+    cfg = EVM_NETWORKS[network]
     try:
         async with session.get(
             "https://api.etherscan.io/v2/api",
             params={
-                "chainid": 137,
+                "chainid": cfg["chainid"],
                 "module": "account", "action": "tokentx",
-                "contractaddress": USDT_CONTRACT,
+                "contractaddress": cfg["contract"],
                 "address": address,
                 "sort": "desc", "page": 1, "offset": offset,
-                "apikey": POLYGONSCAN_API_KEY,
+                "apikey": ETHERSCAN_API_KEY,
             },
             timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
@@ -233,20 +286,21 @@ async def fetch_polygon_confirmed(address, session, offset=10):
             if data.get("status") == "1":
                 return data.get("result", [])
     except Exception as ex:
-        log.warning(f"Polygon confirmed API hatasi: {ex}")
+        log.warning(f"EVM ({network}) confirmed API hatasi: {ex}")
     return []
 
-async def fetch_polygon_usdt_balance(address, session):
+async def fetch_evm_usdt_balance(address, session, network):
+    cfg = EVM_NETWORKS[network]
     try:
         async with session.get(
             "https://api.etherscan.io/v2/api",
             params={
-                "chainid": 137,
+                "chainid": cfg["chainid"],
                 "module": "account", "action": "tokenbalance",
-                "contractaddress": USDT_CONTRACT,
+                "contractaddress": cfg["contract"],
                 "address": address,
                 "tag": "latest",
-                "apikey": POLYGONSCAN_API_KEY,
+                "apikey": ETHERSCAN_API_KEY,
             },
             timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
@@ -254,7 +308,7 @@ async def fetch_polygon_usdt_balance(address, session):
             if data.get("status") == "1":
                 return int(data.get("result", 0)) / 1e6
     except Exception as ex:
-        log.warning(f"Polygon balance API hatasi: {ex}")
+        log.warning(f"EVM ({network}) balance API hatasi: {ex}")
     return 0.0
 
 # ── SOLANA ──
@@ -362,6 +416,116 @@ def _solana_tx_delta(tx, owner):
 
     return None
 
+# ── NONLOGS.IO/RESERVES ──
+def _strip_html_to_text(html):
+    """HTML'i duz metne cevirir (script/style haric), sayfa yapisi degisse bile
+    metin akisi ayni kaldigi surece parse edilebilir olsun diye."""
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+async def fetch_nonlogs_reserves(session):
+    """
+    https://nonlogs.io/reserves sayfasindan BTC / GRIN / USDT (Tether) toplam
+    kullanici bakiyelerini ceker. Sayfada resmi bir JSON API olmadigi icin HTML
+    parse edilir. Sayfa yapisi degisirse ilgili varlik icin log uyarisi basar
+    ve o varligi atlar (crash etmez).
+    Donus: {"BTC": 0.63005365, "GRIN": 3162454.76677309, "USDT": 521.196633}
+    """
+    try:
+        async with session.get(
+            NONLOGS_RESERVES_URL,
+            timeout=aiohttp.ClientTimeout(total=20),
+            headers={"User-Agent": "Mozilla/5.0 (WalletTrackerBot)"},
+        ) as r:
+            if r.status != 200:
+                log.warning(f"Nonlogs reserves HTTP {r.status}")
+                return {}
+            html = await r.text()
+    except Exception as ex:
+        log.warning(f"Nonlogs reserves fetch hatasi: {ex}")
+        return {}
+
+    text = _strip_html_to_text(html)
+    result = {}
+    for coin, cfg in NONLOGS_TRACKED_ASSETS.items():
+        pattern = (
+            re.escape(cfg["heading"]) + r"\s*" + re.escape(cfg["symbol_line"]) +
+            r"\s*Total user balance\s*([\d,]+\.\d+)\s*" + re.escape(cfg["unit"])
+        )
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                result[coin] = float(m.group(1).replace(",", ""))
+            except ValueError:
+                log.warning(f"Nonlogs reserves: {coin} degeri sayisal olarak parse edilemedi.")
+        else:
+            log.warning(f"Nonlogs reserves: {coin} degeri sayfada bulunamadi (site yapisi degismis olabilir).")
+    return result
+
+async def initialize_nonlogs_snapshot():
+    """Bot baslarken nonlogs.io/reserves bakiyelerini baz deger olarak kaydeder,
+    bildirim gondermeden (ilk deger referans noktasidir)."""
+    global nonlogs_reserves
+    current = await fetch_nonlogs_reserves(HTTP_SESSION)
+    if not current:
+        log.warning("Nonlogs reserves baslangic verisi alinamadi, ilk kontrolde tekrar denenecek.")
+        return
+    for coin, value in current.items():
+        if coin not in nonlogs_reserves:
+            nonlogs_reserves[coin] = value
+    save_json(NONLOGS_STATE_FILE, nonlogs_reserves)
+    log.info(f"Nonlogs reserves snapshot alindi: {nonlogs_reserves}")
+
+async def check_nonlogs_reserves(bot: Bot):
+    """nonlogs.io/reserves sayfasini yeniden ceker, onceki degerle karsilastirir,
+    degisiklik varsa Telegram'a bildirim gonderir (ornek: '-0.12000000 BTC')."""
+    global nonlogs_reserves
+    current = await fetch_nonlogs_reserves(HTTP_SESSION)
+    if not current:
+        return
+
+    changed = False
+    for coin, value in current.items():
+        cfg      = NONLOGS_TRACKED_ASSETS[coin]
+        decimals = cfg["decimals"]
+        prev     = nonlogs_reserves.get(coin)
+
+        if prev is None:
+            nonlogs_reserves[coin] = value
+            changed = True
+            continue
+
+        delta = value - prev
+        # Kayan nokta yuvarlama gurultusunu degil, gercek degisimi yakala
+        if abs(delta) < (10 ** -decimals) / 2:
+            continue
+
+        icon = "📈" if delta > 0 else "📉"
+        sign = "+" if delta > 0 else ""
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=(
+                f"{icon} <b>Nonlogs Rezerv Degisikligi - {coin}</b>\n"
+                "────────────────────────────\n"
+                f"🔄 <b>Degisim:</b> <code>{sign}{delta:.{decimals}f} {coin}</code>\n"
+                f"💰 <b>Onceki:</b> <code>{prev:.{decimals}f} {coin}</code>\n"
+                f"💰 <b>Guncel:</b> <code>{value:.{decimals}f} {coin}</code>\n"
+                f"🕐 <b>Zaman:</b> {e(now_str())}\n"
+                f'🔗 <a href="{NONLOGS_RESERVES_URL}">Nonlogs Reserves</a>'
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        nonlogs_reserves[coin] = value
+        changed = True
+
+    if changed:
+        save_json(NONLOGS_STATE_FILE, nonlogs_reserves)
+
 # ──────────────────────────────────────────────────────
 # MESAJ FORMATLAMA
 # ──────────────────────────────────────────────────────
@@ -398,7 +562,8 @@ def format_btc_tx(wallet_name, address, tx, is_pending=False):
         f"🔑 <b>TX:</b> <code>{e(txid)}</code>"
     )
 
-def format_polygon_tx(wallet_name, address, tx, is_pending=False):
+def format_evm_tx(wallet_name, address, tx, network, is_pending=False):
+    net_label   = "Ethereum" if network == "eth" else "Polygon"
     txhash      = tx.get("hash", "")
     value       = int(tx.get("value", 0)) / 1e6
     from_addr   = tx.get("from", "")
@@ -412,11 +577,11 @@ def format_polygon_tx(wallet_name, address, tx, is_pending=False):
     gas_gwei    = int(tx.get("gasPrice", 0)) / 1e9
 
     if is_pending:
-        header     = "⚡ <b>Yeni USDT Islemi - PENDING!</b>"
+        header     = f"⚡ <b>Yeni {net_label} USDT Islemi - PENDING!</b>"
         status_str = "⏳ PENDING"
         time_str   = now_str()
     else:
-        header     = "🔔 <b>Yeni USDT Islemi!</b>"
+        header     = f"🔔 <b>Yeni {net_label} USDT Islemi!</b>"
         status_str = f"Onaylandi ✅ ({confs} onay)"
         time_str   = ts_to_str(tx.get("timeStamp"))
 
@@ -468,8 +633,8 @@ async def initialize_snapshots():
             txs     = await fetch_btc_txs(address, HTTP_SESSION)
             mempool = await fetch_btc_mempool_txs(address, HTTP_SESSION)
             ids     = [tx["txid"] for tx in txs[:20]] + [tx["txid"] for tx in mempool]
-        elif cfg["network"] == "polygon":
-            txs = await fetch_polygon_confirmed(address, HTTP_SESSION)
+        elif cfg["network"] in EVM_NETWORKS:
+            txs = await fetch_evm_confirmed(address, HTTP_SESSION, cfg["network"])
             ids = [tx["hash"] for tx in txs[:20]]
         elif cfg["network"] == "solana":
             token_account, _ = await fetch_solana_usdt_account(address, HTTP_SESSION, use_cache=False)
@@ -496,10 +661,10 @@ def _summarize_btc(tx, address):
     is_in  = any(o.get("scriptpubkey_address") == address for o in vout)
     return {"type": "btc", "amount": amount, "is_in": is_in}
 
-def _summarize_polygon(tx, address):
+def _summarize_evm(tx, address, network):
     amount = int(tx.get("value", 0)) / 1e6
     is_in  = tx.get("to", "").lower() == address.lower()
-    return {"type": "polygon_usdt", "amount": amount, "is_in": is_in}
+    return {"type": f"{network}_usdt", "amount": amount, "is_in": is_in}
 
 def _summarize_solana(amount, is_in):
     return {"type": "solana_usdt", "amount": amount, "is_in": is_in}
@@ -556,9 +721,9 @@ async def check_wallets(bot: Bot):
 
             seen_txs[name] = seen_txs.get(name, [])[-100:]
 
-        # ── POLYGON ──
-        elif network == "polygon":
-            for tx in await fetch_polygon_confirmed(address, session):
+        # ── EVM (Ethereum / Polygon) ──
+        elif network in EVM_NETWORKS:
+            for tx in await fetch_evm_confirmed(address, session, network):
                 txhash = tx.get("hash", "")
                 if not txhash:
                     continue
@@ -568,20 +733,20 @@ async def check_wallets(bot: Bot):
                         text=format_confirmed_update(name, txhash,
                             f"📋 <b>Onay:</b> {tx.get('confirmations','?')}\n"),
                         parse_mode=ParseMode.HTML,
-                        reply_markup=polygon_tx_keyboard(txhash),
+                        reply_markup=evm_tx_keyboard(txhash, network),
                         disable_web_page_preview=True,
                     )
                     del pending_txs[txhash]
                 elif txhash not in seen_txs.get(name, []):
                     await bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=format_polygon_tx(name, address, tx),
+                        text=format_evm_tx(name, address, tx, network),
                         parse_mode=ParseMode.HTML,
-                        reply_markup=polygon_tx_keyboard(txhash),
+                        reply_markup=evm_tx_keyboard(txhash, network),
                         disable_web_page_preview=True,
                     )
                     seen_txs.setdefault(name, []).append(txhash)
-                    daily_txs[name].append(_summarize_polygon(tx, address))
+                    daily_txs[name].append(_summarize_evm(tx, address, network))
 
             seen_txs[name] = seen_txs.get(name, [])[-100:]
 
@@ -650,8 +815,8 @@ async def _bakiye_data():
                 )
             else:
                 lines.append(f"\n👛 <b>{e(name)}</b>\n  ❌ Bakiye alinamadi.")
-        elif cfg["network"] == "polygon":
-            balance = await fetch_polygon_usdt_balance(address, session)
+        elif cfg["network"] in EVM_NETWORKS:
+            balance = await fetch_evm_usdt_balance(address, session, cfg["network"])
             lines.append(
                 f"\n👛 <b>{e(name)}</b>\n"
                 f"  💰 Bakiye: <code>{balance:.2f} USDT</code>\n"
@@ -726,22 +891,23 @@ async def _sonislem_data():
             else:
                 lines.append("  Hic islem bulunamadi.")
 
-        elif cfg["network"] == "polygon":
-            txs = await fetch_polygon_confirmed(address, session, offset=1)
+        elif cfg["network"] in EVM_NETWORKS:
+            txs = await fetch_evm_confirmed(address, session, cfg["network"], offset=1)
             if txs:
                 tx     = txs[0]
                 txhash = tx.get("hash", "")
                 value  = int(tx.get("value", 0)) / 1e6
                 is_in  = tx.get("to", "").lower() == address.lower()
                 icon   = "📥" if is_in else "📤"
+                explorer_url = EVM_NETWORKS[cfg["network"]]["explorer_url"]
                 lines.append(
                     f"  {icon} <code>{value:.2f} USDT</code>\n"
                     f"  📋 {tx.get('confirmations','?')} onay ✅\n"
                     f"  🕐 {ts_to_str(tx.get('timeStamp'))}\n"
-                    f'  <a href="https://polygonscan.com/tx/{txhash}">TX Goruntule</a>'
+                    f'  <a href="{explorer_url}{txhash}">TX Goruntule</a>'
                 )
                 last_txhash  = txhash
-                last_network = "polygon"
+                last_network = cfg["network"]
             else:
                 lines.append("  Hic islem bulunamadi.")
 
@@ -778,8 +944,8 @@ async def _sonislem_data():
     lines.append("\n══════════════════════════════")
     if last_network == "btc" and last_txid:
         keyboard = btc_tx_keyboard(last_txid)
-    elif last_network == "polygon" and last_txhash:
-        keyboard = polygon_tx_keyboard(last_txhash)
+    elif last_network in EVM_NETWORKS and last_txhash:
+        keyboard = evm_tx_keyboard(last_txhash, last_network)
     elif last_network == "solana" and last_signature:
         keyboard = solana_tx_keyboard(last_signature)
     else:
@@ -792,9 +958,12 @@ def _bekleyenler_data():
     lines = [f"⏳ <b>Bekleyen Islemler</b>\n🕐 {now_str()}\n══════════════════════════════"]
     for txid, info in pending_txs.items():
         typ  = info.get("type", "?")
-        link = (f'<a href="https://mempool.space/tx/{txid}">Mempool.space</a>'
-                if typ == "btc" else
-                f'<a href="https://polygonscan.com/tx/{txid}">Polygonscan</a>')
+        if typ == "btc":
+            link = f'<a href="https://mempool.space/tx/{txid}">Mempool.space</a>'
+        elif typ in EVM_NETWORKS:
+            link = f'<a href="{EVM_NETWORKS[typ]["explorer_url"]}{txid}">{EVM_NETWORKS[typ]["explorer_name"]}</a>'
+        else:
+            link = ""
         lines.append(
             f"\n👛 <b>{e(info.get('wallet','?'))}</b>\n"
             f"  🔑 <code>{e(txid[:30])}...</code>\n"
@@ -821,10 +990,21 @@ def _sistemkontrol_text():
         f"📈 <b>Bugunun islemi:</b> <code>{sum(len(v) for v in daily_txs.values())}</code>",
         "",
     ]
-    net_label = {"btc": "BTC", "polygon": "Polygon", "solana": "Solana"}
+    net_label = {"btc": "BTC", "eth": "Ethereum", "polygon": "Polygon", "solana": "Solana"}
     for name, cfg in WALLETS.items():
         net = net_label.get(cfg["network"], cfg["network"])
         lines.append(f"  ✅ {e(name)} ({net})")
+
+    lines.append("")
+    lines.append(f"🌐 <b>Nonlogs Reserves</b> (her {NONLOGS_CHECK_INTERVAL_SECONDS}sn):")
+    if nonlogs_reserves:
+        for coin, cfg in NONLOGS_TRACKED_ASSETS.items():
+            val = nonlogs_reserves.get(coin)
+            if val is not None:
+                lines.append(f"  ✅ {coin}: <code>{val:.{cfg['decimals']}f}</code>")
+    else:
+        lines.append("  ⏳ Henuz snapshot alinmadi.")
+
     lines += ["══════════════════════════════", "<i>Tum sistemler calisiyor.</i>"]
     return "\n".join(lines)
 
@@ -933,6 +1113,7 @@ async def main():
 
     try:
         await initialize_snapshots()
+        await initialize_nonlogs_snapshot()
 
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         app.add_handler(CommandHandler("start",         cmd_start))
@@ -958,6 +1139,8 @@ async def main():
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(check_wallets, "interval", seconds=CHECK_INTERVAL_SECONDS,
                           args=[app.bot], id="check_wallets", max_instances=1)
+        scheduler.add_job(check_nonlogs_reserves, "interval", seconds=NONLOGS_CHECK_INTERVAL_SECONDS,
+                          args=[app.bot], id="check_nonlogs_reserves", max_instances=1)
         scheduler.add_job(send_daily_report, "cron",
                           hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE,
                           args=[app.bot], id="daily_report")
@@ -969,6 +1152,7 @@ async def main():
                 "✅ <b>Cuzdan Takip Botu Basladi!</b>\n\n"
                 f"🔍 Takip: {len(WALLETS)} cuzdan\n"
                 f"⏱ Kontrol: {CHECK_INTERVAL_SECONDS} saniye\n"
+                f"🌐 Nonlogs Reserves (BTC/GRIN/USDT): {NONLOGS_CHECK_INTERVAL_SECONDS} saniyede bir\n"
                 f"📊 Gunluk ozet: {DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d} UTC\n\n"
                 "Komutlar icin /yardim yaz."
             ),
