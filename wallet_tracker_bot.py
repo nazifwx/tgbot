@@ -70,16 +70,6 @@ TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "492272237")
 WALLETS_FILE = "wallets.json"
 
 DEFAULT_WALLETS = {
-    "BTC Cuzdan 1": {
-        "address": "bc1q4uxrzj5kday3xtfz28ju6k4re8npa8jeaddmug",
-        "network": "btc",
-        "symbol":  "BTC",
-    },
-    "BTC Cuzdan 2": {
-        "address": "bc1qyz28dm0vxt6jj7lu9f837570az4ewutzdrcq3q",
-        "network": "btc",
-        "symbol":  "BTC",
-    },
     "Solana Cuzdan": {
         "address": "6ZusgXdQDNvRiqzqJ1mj7xsRCcAnLGzNgyB7weWVUb2F",
         "network": "solana",
@@ -151,6 +141,7 @@ NONLOGS_TRACKED_ASSETS = {
     "BTC":  {"heading": "Bitcoin",    "symbol_line": "BTC BTC",    "unit": "BTC",  "decimals": 8},
     "GRIN": {"heading": "Grin",       "symbol_line": "GRIN Grin",  "unit": "GRIN", "decimals": 8},
     "USDT": {"heading": "Tether USD", "symbol_line": "USDT ETH",   "unit": "USDT", "decimals": 6},
+    "XMR":  {"heading": "Monero",     "symbol_line": "XMR XMR",    "unit": "XMR",  "decimals": 8},
 }
 
 BOT_START_TIME = time.time()
