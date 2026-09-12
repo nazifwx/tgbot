@@ -1,20 +1,18 @@
 """
 Telegram Cuzdan Takip Botu
-- 2x BTC cuzdani (mempool + confirmed)
-- 1x Ethereum mainnet USDT (ERC-20) - 30sn polling
-- 1x Solana USDT / SPL - 30sn polling (RPC ile confirmed islemler)
+- BTC / Ethereum (USDT) / Polygon (USDT) / Solana (USDT) destegi
+- Cuzdanlar artik SABIT KOD DEGIL: /cuzdanekle ve /cuzdansil komutlariyla
+  (ya da menudeki butonlarla) Telegram uzerinden interaktif olarak
+  eklenip cikartilabilir. Liste "wallets.json" dosyasinda saklanir.
 - Inline butonlar
 - Gunluk ozet raporu
+- nonlogs.io/reserves takibi (degismedi)
 - /komutlar destegi
 
 RAM OPTIMIZASYONLARI (islev kaybi olmadan):
   1) Tum HTTP istekleri icin tek, paylasimli aiohttp.ClientSession kullanilir.
-     Eskiden her kontrol donguusnde / her komutta yeni bir session acilip
-     kapatiliyordu (yeni connector havuzu = fazladan bellek + GC yuku).
   2) daily_txs artik ham (raw) API cevabini degil, sadece rapor icin
-     gereken minimal alanlari (miktar, yon, tip) saklar. BTC/EVM/Solana
-     ham JSON'lari (vin/vout, gas bilgisi, log index, pre/postTokenBalances vs.)
-     gun icinde onlarca islem biriktiginde gereksiz yere bellek tuketiyordu.
+     gereken minimal alanlari (miktar, yon, tip) saklar.
 
 EVM (ETH / POLYGON) NOTU:
   Ethereum ve Polygon USDT takibi ayni Etherscan v2 API'si uzerinden
@@ -27,6 +25,14 @@ SOLANA NOTU:
   Bu endpoint sik sik rate-limit (429) doner. Kararli calisma icin ucretsiz/
   ucretli ozel bir RPC saglayicisi (Helius, QuickNode, Alchemy vb.) onerilir;
   SOLANA_RPC_URL ortam degiskeniyle degistirilebilir.
+
+CUZDAN YONETIMI (YENI):
+  /cuzdanekle  -> Ag secimi (BTC / ETH / Polygon / Solana) -> adres -> isim
+                  sorulur, dogrulanir ve anlik olarak takibe eklenir.
+  /cuzdansil   -> Mevcut cuzdanlardan biri secilip onay ile silinir.
+  /cuzdanlar   -> Su an takip edilen tum cuzdanlarin listesi.
+  Ana menudeki "➕ Cuzdan Ekle" / "➖ Cuzdan Sil" / "📋 Cuzdanlar" butonlari
+  ile de ayni islemler yapilabilir.
 """
 
 import asyncio
@@ -39,7 +45,15 @@ import aiohttp
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot, Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
 from telegram.constants import ParseMode
 
 # ──────────────────────────────────────────────────────
@@ -51,15 +65,17 @@ from telegram.constants import ParseMode
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "8649558470:AAHCRXTKxCiVi2MaAp88trJVe7McE8v7j9k")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "492272237")
 
-# Takip edilen cuzdanlar. BTC, EVM USDT (Ethereum/Polygon) ve Solana USDT (SPL)
-# karisik olarak eklenebilir; her girdi kendi "network" alanina gore islenir.
-WALLETS = {
-    "bc1q4uxrzj5kday3xtfz28ju6k4re8npa8jeaddmug": {
+# Cuzdanlar artik kod icinde sabit degil, wallets.json dosyasindan okunur.
+# Dosya yoksa asagidaki varsayilan liste ile olusturulur (ilk kurulum).
+WALLETS_FILE = "wallets.json"
+
+DEFAULT_WALLETS = {
+    "BTC Cuzdan 1": {
         "address": "bc1q4uxrzj5kday3xtfz28ju6k4re8npa8jeaddmug",
         "network": "btc",
         "symbol":  "BTC",
     },
-    "bc1qyz28dm0vxt6jj7lu9f837570az4ewutzdrcq3q": {
+    "BTC Cuzdan 2": {
         "address": "bc1qyz28dm0vxt6jj7lu9f837570az4ewutzdrcq3q",
         "network": "btc",
         "symbol":  "BTC",
@@ -78,7 +94,7 @@ WALLETS = {
 
 # EVM (Ethereum / Polygon) USDT kontrat adresleri
 USDT_CONTRACT_ETH      = "0xdAC17F958D2ee523a2206206994597C13D831ec7"   # Ethereum mainnet USDT
-USDT_CONTRACT_POLYGON  = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"   # Polygon USDT (referans - su an takip edilmiyor)
+USDT_CONTRACT_POLYGON  = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"   # Polygon USDT
 ETHERSCAN_API_KEY      = os.getenv("ETHERSCAN_API_KEY", os.getenv("POLYGONSCAN_API_KEY", "RGSD69N6JG2KM9IIMJME2G8W8Y9N6FX6JY"))
 
 # network adi -> (chainid, kontrat adresi, explorer adi, explorer tx URL taban)
@@ -106,14 +122,31 @@ DAILY_REPORT_HOUR      = 20   # UTC
 DAILY_REPORT_MINUTE    = 0
 CHECK_INTERVAL_SECONDS = 30
 
-# ── nonlogs.io/reserves takibi ──
-# Bu sayfa icin resmi bir JSON API yok (nonlogs.io/api sadece markets/orderbook/order
-# endpointlerini sunuyor), o yuzden sayfa HTML'i cekilip parse edilir. Sayfaya asiri
-# yuk bindirmemek icin ayri ve daha seyrek bir kontrol araligi kullanilir.
+# Desteklenen aglar - /cuzdanekle akisinda kullanicidan secmesi istenir.
+NETWORK_LABELS = {
+    "btc":     "🟠 Bitcoin (BTC)",
+    "eth":     "🔷 Ethereum (USDT)",
+    "polygon": "🟣 Polygon (USDT)",
+    "solana":  "🟢 Solana (USDT)",
+}
+NETWORK_EMOJI = {"btc": "🟠", "eth": "🔷", "polygon": "🟣", "solana": "🟢"}
+NETWORK_SYMBOL = {"btc": "BTC", "eth": "USDT", "polygon": "USDT", "solana": "USDT"}
+
+# Adres format dogrulamasi (kaba ama pratik bir kontrol - kesin garanti degildir)
+ADDRESS_PATTERNS = {
+    "btc":     re.compile(r"^(bc1[a-z0-9]{25,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$"),
+    "eth":     re.compile(r"^0x[a-fA-F0-9]{40}$"),
+    "polygon": re.compile(r"^0x[a-fA-F0-9]{40}$"),
+    "solana":  re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"),
+}
+
+# Cuzdan ekleme akisi (ConversationHandler) durumlari
+ADDING_NETWORK, ADDING_ADDRESS, ADDING_NAME = range(3)
+
+# ── nonlogs.io/reserves takibi (degismedi) ──
 NONLOGS_RESERVES_URL          = "https://nonlogs.io/reserves"
 NONLOGS_CHECK_INTERVAL_SECONDS = 60
 NONLOGS_STATE_FILE            = "nonlogs_reserves.json"
-# Takip edilen varliklar: coin -> (sayfadaki baslik metni, sembol satiri, ondalik hassasiyet)
 NONLOGS_TRACKED_ASSETS = {
     "BTC":  {"heading": "Bitcoin",    "symbol_line": "BTC BTC",    "unit": "BTC",  "decimals": 8},
     "GRIN": {"heading": "Grin",       "symbol_line": "GRIN Grin",  "unit": "GRIN", "decimals": 8},
@@ -141,14 +174,22 @@ def load_json(path):
 
 def save_json(path, data):
     with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def load_wallets():
+    data = load_json(WALLETS_FILE)
+    if not data:
+        data = dict(DEFAULT_WALLETS)
+        save_json(WALLETS_FILE, data)
+    return data
 
 seen_txs    = load_json(STATE_FILE)
 pending_txs = load_json(PENDING_FILE)
+WALLETS     = load_wallets()
 # Artik ham tx degil, minimal ozet dict tutuluyor: {"type":..,"amount":..,"is_in":..}
 daily_txs   = {name: [] for name in WALLETS}
 
-# nonlogs.io/reserves icin son bilinen bakiyeler: {"BTC": 0.63005365, "GRIN": ..., "USDT": ...}
+# nonlogs.io/reserves icin son bilinen bakiyeler
 nonlogs_reserves = load_json(NONLOGS_STATE_FILE)
 
 # Solana icin: sahibin (owner) USDT associated token account (ATA) adresini
@@ -172,6 +213,14 @@ def ts_to_str(ts):
 
 def now_str():
     return (datetime.now(tz=timezone.utc) + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M (TR)")
+
+def net_label(network):
+    return NETWORK_LABELS.get(network, network)
+
+def net_emoji(network):
+    return NETWORK_EMOJI.get(network, "🔘")
+
+DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 
 # ──────────────────────────────────────────────────────
 # INLINE KLAVYELER
@@ -223,7 +272,41 @@ def main_menu_keyboard():
             InlineKeyboardButton("⏳ Bekleyenler", callback_data="bekleyenler"),
         ],
         [
-            InlineKeyboardButton("🖥️ Sistem Kontrol", callback_data="sistemkontrol"),
+            InlineKeyboardButton("📋 Cüzdanlar", callback_data="cuzdanlar"),
+            InlineKeyboardButton("🖥️ Sistem", callback_data="sistemkontrol"),
+        ],
+        [
+            InlineKeyboardButton("➕ Cüzdan Ekle", callback_data="cuzdanekle_baslat"),
+            InlineKeyboardButton("➖ Cüzdan Sil", callback_data="cuzdansil_baslat"),
+        ],
+    ])
+
+def network_choice_keyboard():
+    rows = []
+    row = []
+    for net, label in NETWORK_LABELS.items():
+        row.append(InlineKeyboardButton(label, callback_data=f"addnet_{net}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("❌ İptal", callback_data="addnet_iptal")])
+    return InlineKeyboardMarkup(rows)
+
+def wallet_delete_keyboard():
+    rows = []
+    for name, cfg in WALLETS.items():
+        label = f"{net_emoji(cfg['network'])} {name}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"delwallet_{name}")])
+    rows.append([InlineKeyboardButton("❌ İptal", callback_data="delwallet_iptal")])
+    return InlineKeyboardMarkup(rows)
+
+def wallet_delete_confirm_keyboard(name):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Evet, Sil", callback_data=f"delconfirm_{name}"),
+            InlineKeyboardButton("↩️ Vazgeç", callback_data="delcancel"),
         ],
     ])
 
@@ -336,12 +419,10 @@ async def fetch_solana_usdt_account(owner, session, use_cache=True):
     """
     if use_cache and owner in solana_token_account_cache and solana_token_account_cache[owner]:
         token_account = solana_token_account_cache[owner]
-        # Cache'de adres var, sadece guncel bakiyeyi cekmek icin getTokenAccountBalance kullan
         result = await _solana_rpc("getTokenAccountBalance", [token_account], session)
         if result:
             balance = float(result.get("value", {}).get("uiAmount") or 0)
             return token_account, balance
-        # Cache gecersiz kaldiysa asagida yeniden arayacagiz
 
     result = await _solana_rpc(
         "getTokenAccountsByOwner",
@@ -396,7 +477,6 @@ def _solana_tx_delta(tx, owner):
     pre_map  = {b["accountIndex"]: b for b in pre  if b.get("mint") == USDT_SOLANA_MINT}
     post_map = {b["accountIndex"]: b for b in post if b.get("mint") == USDT_SOLANA_MINT}
 
-    # Hesap hala aciksa (postTokenBalances icinde var)
     for idx, pb in post_map.items():
         if pb.get("owner") != owner:
             continue
@@ -406,7 +486,6 @@ def _solana_tx_delta(tx, owner):
         if delta != 0:
             return abs(delta), delta > 0
 
-    # Hesap bu islemde kapatildiysa (sadece preTokenBalances icinde var)
     for idx, pb in pre_map.items():
         if pb.get("owner") != owner or idx in post_map:
             continue
@@ -416,10 +495,8 @@ def _solana_tx_delta(tx, owner):
 
     return None
 
-# ── NONLOGS.IO/RESERVES ──
+# ── NONLOGS.IO/RESERVES ── (degismedi)
 def _strip_html_to_text(html):
-    """HTML'i duz metne cevirir (script/style haric), sayfa yapisi degisse bile
-    metin akisi ayni kaldigi surece parse edilebilir olsun diye."""
     text = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -428,13 +505,6 @@ def _strip_html_to_text(html):
     return text.strip()
 
 async def fetch_nonlogs_reserves(session):
-    """
-    https://nonlogs.io/reserves sayfasindan BTC / GRIN / USDT (Tether) toplam
-    kullanici bakiyelerini ceker. Sayfada resmi bir JSON API olmadigi icin HTML
-    parse edilir. Sayfa yapisi degisirse ilgili varlik icin log uyarisi basar
-    ve o varligi atlar (crash etmez).
-    Donus: {"BTC": 0.63005365, "GRIN": 3162454.76677309, "USDT": 521.196633}
-    """
     try:
         async with session.get(
             NONLOGS_RESERVES_URL,
@@ -467,8 +537,6 @@ async def fetch_nonlogs_reserves(session):
     return result
 
 async def initialize_nonlogs_snapshot():
-    """Bot baslarken nonlogs.io/reserves bakiyelerini baz deger olarak kaydeder,
-    bildirim gondermeden (ilk deger referans noktasidir)."""
     global nonlogs_reserves
     current = await fetch_nonlogs_reserves(HTTP_SESSION)
     if not current:
@@ -481,8 +549,6 @@ async def initialize_nonlogs_snapshot():
     log.info(f"Nonlogs reserves snapshot alindi: {nonlogs_reserves}")
 
 async def check_nonlogs_reserves(bot: Bot):
-    """nonlogs.io/reserves sayfasini yeniden ceker, onceki degerle karsilastirir,
-    degisiklik varsa Telegram'a bildirim gonderir (ornek: '-0.12000000 BTC')."""
     global nonlogs_reserves
     current = await fetch_nonlogs_reserves(HTTP_SESSION)
     if not current:
@@ -500,7 +566,6 @@ async def check_nonlogs_reserves(bot: Bot):
             continue
 
         delta = value - prev
-        # Kayan nokta yuvarlama gurultusunu degil, gercek degisimi yakala
         if abs(delta) < (10 ** -decimals) / 2:
             continue
 
@@ -509,11 +574,11 @@ async def check_nonlogs_reserves(bot: Bot):
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
-                f"{icon} <b>Nonlogs Rezerv Degisikligi - {coin}</b>\n"
-                "────────────────────────────\n"
-                f"🔄 <b>Degisim:</b> <code>{sign}{delta:.{decimals}f} {coin}</code>\n"
-                f"💰 <b>Onceki:</b> <code>{prev:.{decimals}f} {coin}</code>\n"
-                f"💰 <b>Guncel:</b> <code>{value:.{decimals}f} {coin}</code>\n"
+                f"{icon} <b>Nonlogs Rezerv Değişikliği · {coin}</b>\n"
+                f"{DIVIDER}\n"
+                f"🔄 <b>Değişim:</b> <code>{sign}{delta:.{decimals}f} {coin}</code>\n"
+                f"💰 <b>Önceki:</b> <code>{prev:.{decimals}f} {coin}</code>\n"
+                f"💰 <b>Güncel:</b> <code>{value:.{decimals}f} {coin}</code>\n"
                 f"🕐 <b>Zaman:</b> {e(now_str())}\n"
                 f'🔗 <a href="{NONLOGS_RESERVES_URL}">Nonlogs Reserves</a>'
             ),
@@ -535,113 +600,169 @@ def format_btc_tx(wallet_name, address, tx, is_pending=False):
     status      = tx.get("status", {})
     is_incoming = any(o.get("scriptpubkey_address") == address for o in vout)
     dir_icon    = "📥" if is_incoming else "📤"
-    direction   = "GIRIS" if is_incoming else "CIKIS"
+    direction   = "GİRİŞ" if is_incoming else "ÇIKIŞ"
     amount_sat  = sum(o.get("value", 0) for o in vout if o.get("scriptpubkey_address") == address)
     amount_str  = f"{amount_sat / 1e8:.8f} BTC" if amount_sat else "?"
     fee_sat     = tx.get("fee", 0)
     fee_str     = f"{fee_sat / 1e8:.8f} BTC" if fee_sat else "?"
 
     if is_pending:
-        header     = "⚡ <b>Yeni BTC Islemi - PENDING!</b>"
-        status_str = "⏳ PENDING (Mempool)"
+        header     = "⚡ <b>Yeni BTC İşlemi · PENDING</b>"
+        status_str = "⏳ Bekliyor (Mempool)"
         time_str   = now_str()
     else:
-        header     = "🔔 <b>Yeni BTC Islemi!</b>"
-        status_str = "Onaylandi ✅" if status.get("confirmed") else "Bekliyor ⏳"
+        header     = "🔔 <b>Yeni BTC İşlemi</b>"
+        status_str = "✅ Onaylandı" if status.get("confirmed") else "⏳ Bekliyor"
         time_str   = ts_to_str(status.get("block_time"))
 
     return (
         f"{header}\n"
-        f"👛 <b>Cuzdan:</b> {e(wallet_name)}\n"
-        "────────────────────────────\n"
-        f"{dir_icon} <b>Yon:</b> {direction}\n"
+        f"{net_emoji('btc')} <b>Cüzdan:</b> {e(wallet_name)}\n"
+        f"{DIVIDER}\n"
+        f"{dir_icon} <b>Yön:</b> {direction}\n"
         f"💰 <b>Miktar:</b> <code>{e(amount_str)}</code>\n"
-        f"⛽ <b>Ucret:</b> <code>{e(fee_str)}</code>\n"
+        f"⛽ <b>Ücret:</b> <code>{e(fee_str)}</code>\n"
         f"📋 <b>Durum:</b> {status_str}\n"
         f"🕐 <b>Zaman:</b> {e(time_str)}\n"
-        f"🔑 <b>TX:</b> <code>{e(txid)}</code>"
+        f"{DIVIDER}\n"
+        f"🔑 <code>{e(txid)}</code>"
     )
 
 def format_evm_tx(wallet_name, address, tx, network, is_pending=False):
-    net_label   = "Ethereum" if network == "eth" else "Polygon"
+    net_name    = "Ethereum" if network == "eth" else "Polygon"
     txhash      = tx.get("hash", "")
     value       = int(tx.get("value", 0)) / 1e6
     from_addr   = tx.get("from", "")
     to_addr     = tx.get("to", "")
     is_incoming = to_addr.lower() == address.lower()
     dir_icon    = "📥" if is_incoming else "📤"
-    direction   = "GIRIS" if is_incoming else "CIKIS"
-    label       = "Gonderen" if is_incoming else "Alici"
+    direction   = "GİRİŞ" if is_incoming else "ÇIKIŞ"
+    label       = "Gönderen" if is_incoming else "Alıcı"
     counterpart = from_addr if is_incoming else to_addr
     confs       = int(tx.get("confirmations", 0))
     gas_gwei    = int(tx.get("gasPrice", 0)) / 1e9
 
     if is_pending:
-        header     = f"⚡ <b>Yeni {net_label} USDT Islemi - PENDING!</b>"
-        status_str = "⏳ PENDING"
+        header     = f"⚡ <b>Yeni {net_name} USDT İşlemi · PENDING</b>"
+        status_str = "⏳ Bekliyor"
         time_str   = now_str()
     else:
-        header     = f"🔔 <b>Yeni {net_label} USDT Islemi!</b>"
-        status_str = f"Onaylandi ✅ ({confs} onay)"
+        header     = f"🔔 <b>Yeni {net_name} USDT İşlemi</b>"
+        status_str = f"✅ Onaylandı ({confs} onay)"
         time_str   = ts_to_str(tx.get("timeStamp"))
 
     return (
         f"{header}\n"
-        f"👛 <b>Cuzdan:</b> {e(wallet_name)}\n"
-        "────────────────────────────\n"
-        f"{dir_icon} <b>Yon:</b> {direction}\n"
+        f"{net_emoji(network)} <b>Cüzdan:</b> {e(wallet_name)}\n"
+        f"{DIVIDER}\n"
+        f"{dir_icon} <b>Yön:</b> {direction}\n"
         f"💰 <b>Miktar:</b> <code>{value:.2f} USDT</code>\n"
         f"👤 <b>{label}:</b> <code>{e(counterpart)}</code>\n"
         f"⛽ <b>Gas:</b> <code>{gas_gwei:.1f} Gwei</code>\n"
         f"📋 <b>Durum:</b> {status_str}\n"
         f"🕐 <b>Zaman:</b> {e(time_str)}\n"
-        f"🔑 <b>TX:</b> <code>{e(txhash)}</code>"
+        f"{DIVIDER}\n"
+        f"🔑 <code>{e(txhash)}</code>"
     )
 
 def format_solana_tx(wallet_name, signature, amount, is_in, block_time):
     dir_icon  = "📥" if is_in else "📤"
-    direction = "GIRIS" if is_in else "CIKIS"
+    direction = "GİRİŞ" if is_in else "ÇIKIŞ"
     return (
-        "🔔 <b>Yeni Solana USDT Islemi!</b>\n"
-        f"👛 <b>Cuzdan:</b> {e(wallet_name)}\n"
-        "────────────────────────────\n"
-        f"{dir_icon} <b>Yon:</b> {direction}\n"
+        "🔔 <b>Yeni Solana USDT İşlemi</b>\n"
+        f"{net_emoji('solana')} <b>Cüzdan:</b> {e(wallet_name)}\n"
+        f"{DIVIDER}\n"
+        f"{dir_icon} <b>Yön:</b> {direction}\n"
         f"💰 <b>Miktar:</b> <code>{amount:.6f} USDT</code>\n"
-        f"📋 <b>Durum:</b> Onaylandi ✅\n"
+        f"📋 <b>Durum:</b> ✅ Onaylandı\n"
         f"🕐 <b>Zaman:</b> {e(ts_to_str(block_time))}\n"
-        f"🔑 <b>TX:</b> <code>{e(signature[:20])}...</code>"
+        f"{DIVIDER}\n"
+        f"🔑 <code>{e(signature[:24])}...</code>"
     )
 
-def format_confirmed_update(wallet_name, txid, extra=""):
+def format_confirmed_update(wallet_name, txid, network, extra=""):
     return (
-        f"✅ <b>Islem Onaylandi!</b>\n"
-        f"👛 <b>Cuzdan:</b> {e(wallet_name)}\n"
-        f"🔑 <b>TX:</b> <code>{e(txid)}</code>\n"
+        f"✅ <b>İşlem Onaylandı</b>\n"
+        f"{net_emoji(network)} <b>Cüzdan:</b> {e(wallet_name)}\n"
+        f"{DIVIDER}\n"
+        f"🔑 <code>{e(txid)}</code>\n"
         f"{extra}"
     )
 
 # ──────────────────────────────────────────────────────
-# SNAPSHOT
+# CUZDAN YARDIMCI FONKSIYONLARI
+# ──────────────────────────────────────────────────────
+async def collect_snapshot_ids(cfg):
+    """Verilen tek bir cuzdan icin, o ana kadarki islem id'lerini toplar
+    (yeni eklenen bir cuzdanin eski islemlerinin bildirim olarak
+    dusmemesi icin baslangic referansi olusturur)."""
+    address = cfg["address"]
+    network = cfg["network"]
+    ids = []
+    if network == "btc":
+        txs     = await fetch_btc_txs(address, HTTP_SESSION)
+        mempool = await fetch_btc_mempool_txs(address, HTTP_SESSION)
+        ids     = [tx["txid"] for tx in txs[:20]] + [tx["txid"] for tx in mempool]
+    elif network in EVM_NETWORKS:
+        txs = await fetch_evm_confirmed(address, HTTP_SESSION, network)
+        ids = [tx["hash"] for tx in txs[:20]]
+    elif network == "solana":
+        token_account, _ = await fetch_solana_usdt_account(address, HTTP_SESSION, use_cache=False)
+        if token_account:
+            sigs = await fetch_solana_signatures(token_account, HTTP_SESSION, limit=25)
+            ids  = [s["signature"] for s in sigs]
+    return ids
+
+def is_valid_address(network, address):
+    pattern = ADDRESS_PATTERNS.get(network)
+    return bool(pattern and pattern.match(address.strip()))
+
+def find_wallet_by_address(address):
+    for name, cfg in WALLETS.items():
+        if cfg["address"].lower() == address.lower():
+            return name
+    return None
+
+async def add_wallet(name, network, address):
+    """Yeni bir cuzdani WALLETS'a ekler, snapshot alir ve diske kaydeder."""
+    cfg = {
+        "address": address,
+        "network": network,
+        "symbol":  NETWORK_SYMBOL.get(network, "?"),
+    }
+    WALLETS[name] = cfg
+    daily_txs.setdefault(name, [])
+    ids = await collect_snapshot_ids(cfg)
+    seen_txs[name] = ids
+    save_json(WALLETS_FILE, WALLETS)
+    save_json(STATE_FILE, seen_txs)
+    log.info(f"Yeni cuzdan eklendi: {name} ({network}) - {len(ids)} eski islem isaretlendi")
+
+def remove_wallet(name):
+    """Cuzdani WALLETS ve ilgili tum state'lerden temizler."""
+    cfg = WALLETS.pop(name, None)
+    if cfg is None:
+        return False
+    seen_txs.pop(name, None)
+    daily_txs.pop(name, None)
+    if cfg["network"] == "solana":
+        solana_token_account_cache.pop(cfg["address"], None)
+    for txid in [k for k, v in pending_txs.items() if v.get("wallet") == name]:
+        pending_txs.pop(txid, None)
+    save_json(WALLETS_FILE, WALLETS)
+    save_json(STATE_FILE, seen_txs)
+    save_json(PENDING_FILE, pending_txs)
+    log.info(f"Cuzdan silindi: {name}")
+    return True
+
+# ──────────────────────────────────────────────────────
+# SNAPSHOT (baslangicta tum cuzdanlar icin)
 # ──────────────────────────────────────────────────────
 async def initialize_snapshots():
     global seen_txs
     log.info("Snapshot aliniyor...")
     for name, cfg in WALLETS.items():
-        address = cfg["address"]
-        ids = []
-        if cfg["network"] == "btc":
-            txs     = await fetch_btc_txs(address, HTTP_SESSION)
-            mempool = await fetch_btc_mempool_txs(address, HTTP_SESSION)
-            ids     = [tx["txid"] for tx in txs[:20]] + [tx["txid"] for tx in mempool]
-        elif cfg["network"] in EVM_NETWORKS:
-            txs = await fetch_evm_confirmed(address, HTTP_SESSION, cfg["network"])
-            ids = [tx["hash"] for tx in txs[:20]]
-        elif cfg["network"] == "solana":
-            token_account, _ = await fetch_solana_usdt_account(address, HTTP_SESSION, use_cache=False)
-            if token_account:
-                sigs = await fetch_solana_signatures(token_account, HTTP_SESSION, limit=25)
-                ids  = [s["signature"] for s in sigs]
-
+        ids = await collect_snapshot_ids(cfg)
         if name not in seen_txs:
             seen_txs[name] = ids
         else:
@@ -675,13 +796,12 @@ def _summarize_solana(amount, is_in):
 async def check_wallets(bot: Bot):
     global seen_txs, pending_txs
     session = HTTP_SESSION
-    for name, cfg in WALLETS.items():
+    for name, cfg in list(WALLETS.items()):
         address = cfg["address"]
         network = cfg["network"]
 
         # ── BTC ──
         if network == "btc":
-            # Mempool (pending)
             for tx in await fetch_btc_mempool_txs(address, session):
                 txid = tx["txid"]
                 if txid not in seen_txs.get(name, []):
@@ -696,13 +816,12 @@ async def check_wallets(bot: Bot):
                     pending_txs[txid] = {"wallet": name, "type": "btc"}
                     daily_txs[name].append(_summarize_btc(tx, address))
 
-            # Confirmed
             for tx in (await fetch_btc_txs(address, session))[:10]:
                 txid = tx["txid"]
                 if txid in pending_txs:
                     await bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=format_confirmed_update(name, txid),
+                        text=format_confirmed_update(name, txid, "btc"),
                         parse_mode=ParseMode.HTML,
                         reply_markup=btc_tx_keyboard(txid),
                         disable_web_page_preview=True,
@@ -730,7 +849,7 @@ async def check_wallets(bot: Bot):
                 if txhash in pending_txs:
                     await bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=format_confirmed_update(name, txhash,
+                        text=format_confirmed_update(name, txhash, network,
                             f"📋 <b>Onay:</b> {tx.get('confirmations','?')}\n"),
                         parse_mode=ParseMode.HTML,
                         reply_markup=evm_tx_keyboard(txhash, network),
@@ -754,10 +873,9 @@ async def check_wallets(bot: Bot):
         elif network == "solana":
             token_account, _bal = await fetch_solana_usdt_account(address, session)
             if not token_account:
-                continue  # bu owner'in henuz USDT token hesabi yok
+                continue
 
             sigs = await fetch_solana_signatures(token_account, session, limit=SOLANA_TX_LIMIT)
-            # En eskiden en yeniye dogru isle, boylece chat'e dogru sirayla dusuyor
             for s in reversed(sigs):
                 sig = s.get("signature")
                 if not sig or sig in seen_txs.get(name, []):
@@ -766,13 +884,12 @@ async def check_wallets(bot: Bot):
                 seen_txs.setdefault(name, []).append(sig)
 
                 if s.get("err"):
-                    # Basarisiz islem, bildirim gonderme ama gorulmus say
                     continue
 
                 tx = await fetch_solana_tx(sig, session)
                 delta = _solana_tx_delta(tx, address)
                 if not delta:
-                    continue  # USDT ile ilgisiz veya parse edilemedi
+                    continue
 
                 amount, is_in = delta
                 block_time = (tx.get("blockTime") if tx else None) or s.get("blockTime")
@@ -795,10 +912,13 @@ async def check_wallets(bot: Bot):
 # VERİ FONKSİYONLARI (komutlar + callback için ortak)
 # ──────────────────────────────────────────────────────
 async def _bakiye_data():
-    lines = [f"💼 <b>Cuzdan Bakiyeleri</b>\n🕐 {now_str()}\n══════════════════════════════"]
+    if not WALLETS:
+        return f"💼 <b>Cüzdan Bakiyeleri</b>\n{DIVIDER}\n✨ Henüz takip edilen cüzdan yok.\n➕ Eklemek için /cuzdanekle yazabilirsin."
+    lines = [f"💼 <b>Cüzdan Bakiyeleri</b>\n🕐 {now_str()}\n{DIVIDER}"]
     session = HTTP_SESSION
     for name, cfg in WALLETS.items():
         address = cfg["address"]
+        header = f"\n{net_emoji(cfg['network'])} <b>{e(name)}</b>"
         if cfg["network"] == "btc":
             info = await fetch_btc_address_info(address, session)
             if info:
@@ -808,37 +928,39 @@ async def _bakiye_data():
                 mem     = info.get("mempool_stats", {})
                 unconf  = (mem.get("funded_txo_sum", 0) - mem.get("spent_txo_sum", 0)) / 1e8
                 lines.append(
-                    f"\n👛 <b>{e(name)}</b>\n"
+                    f"{header}\n"
                     f"  💰 Bakiye: <code>{balance:.8f} BTC</code>\n"
                     f"  ⏳ Bekleyen: <code>{unconf:+.8f} BTC</code>\n"
                     f"  📍 <code>{e(address[:20])}...</code>"
                 )
             else:
-                lines.append(f"\n👛 <b>{e(name)}</b>\n  ❌ Bakiye alinamadi.")
+                lines.append(f"{header}\n  ❌ Bakiye alınamadı.")
         elif cfg["network"] in EVM_NETWORKS:
             balance = await fetch_evm_usdt_balance(address, session, cfg["network"])
             lines.append(
-                f"\n👛 <b>{e(name)}</b>\n"
+                f"{header}\n"
                 f"  💰 Bakiye: <code>{balance:.2f} USDT</code>\n"
                 f"  📍 <code>{e(address[:20])}...</code>"
             )
         elif cfg["network"] == "solana":
             _, balance = await fetch_solana_usdt_account(address, session)
             lines.append(
-                f"\n👛 <b>{e(name)}</b>\n"
+                f"{header}\n"
                 f"  💰 Bakiye: <code>{balance:.6f} USDT</code>\n"
                 f"  📍 <code>{e(address[:20])}...</code>"
             )
-    lines.append("\n══════════════════════════════")
+    lines.append(f"\n{DIVIDER}")
     return "\n".join(lines)
 
 async def _rapor_text():
     lines = [
-        "📊 <b>Gunluk Ozet</b>",
+        "📊 <b>Günlük Özet</b>",
         f"🕐 {now_str()}",
-        "══════════════════════════════",
+        DIVIDER,
     ]
     has_data = False
+    if not WALLETS:
+        lines.append("\n✨ Takip edilen cüzdan yok.")
     for name, cfg in WALLETS.items():
         entries = daily_txs.get(name, [])
         total_in = total_out = 0.0
@@ -850,24 +972,26 @@ async def _rapor_text():
         if entries:
             has_data = True
         lines.append(
-            f"\n👛 <b>{e(name)}</b>\n"
-            f"  📥 Giris: <code>{total_in:.6f} {cfg['symbol']}</code>\n"
-            f"  📤 Cikis: <code>{total_out:.6f} {cfg['symbol']}</code>\n"
-            f"  🔢 Islem: <code>{len(entries)} adet</code>"
+            f"\n{net_emoji(cfg['network'])} <b>{e(name)}</b>\n"
+            f"  📥 Giriş: <code>{total_in:.6f} {cfg['symbol']}</code>\n"
+            f"  📤 Çıkış: <code>{total_out:.6f} {cfg['symbol']}</code>\n"
+            f"  🔢 İşlem: <code>{len(entries)} adet</code>"
         )
-    if not has_data:
-        lines.append("\n✨ Bugun hic islem gerceklesmedi.")
-    lines += ["", "══════════════════════════════"]
+    if WALLETS and not has_data:
+        lines.append("\n✨ Bugün hiç işlem gerçekleşmedi.")
+    lines += ["", DIVIDER]
     return "\n".join(lines)
 
 async def _sonislem_data():
-    lines = [f"🔎 <b>Son Islemler</b>\n🕐 {now_str()}\n══════════════════════════════"]
+    if not WALLETS:
+        return (f"🔎 <b>Son İşlemler</b>\n{DIVIDER}\n✨ Henüz takip edilen cüzdan yok.", main_menu_keyboard())
+    lines = [f"🔎 <b>Son İşlemler</b>\n🕐 {now_str()}\n{DIVIDER}"]
     last_txhash = last_txid = last_signature = last_network = None
     session = HTTP_SESSION
 
     for name, cfg in WALLETS.items():
         address = cfg["address"]
-        lines.append(f"\n👛 <b>{e(name)}</b>")
+        lines.append(f"\n{net_emoji(cfg['network'])} <b>{e(name)}</b>")
 
         if cfg["network"] == "btc":
             txs = await fetch_btc_txs(address, session)
@@ -879,17 +1003,17 @@ async def _sonislem_data():
                 is_in     = any(o.get("scriptpubkey_address") == address for o in vout)
                 amount    = sum(o.get("value", 0) for o in vout if o.get("scriptpubkey_address") == address) / 1e8
                 icon      = "📥" if is_in else "📤"
-                conf_str  = "✅ Onayli" if status.get("confirmed") else "⏳ Pending"
+                conf_str  = "✅ Onaylı" if status.get("confirmed") else "⏳ Bekliyor"
                 lines.append(
                     f"  {icon} <code>{amount:.8f} BTC</code>\n"
                     f"  📋 {conf_str}\n"
                     f"  🕐 {ts_to_str(status.get('block_time'))}\n"
-                    f'  <a href="https://blockstream.info/tx/{txid}">TX Goruntule</a>'
+                    f'  <a href="https://blockstream.info/tx/{txid}">TX Görüntüle</a>'
                 )
                 last_txid    = txid
                 last_network = "btc"
             else:
-                lines.append("  Hic islem bulunamadi.")
+                lines.append("  Hiç işlem bulunamadı.")
 
         elif cfg["network"] in EVM_NETWORKS:
             txs = await fetch_evm_confirmed(address, session, cfg["network"], offset=1)
@@ -904,12 +1028,12 @@ async def _sonislem_data():
                     f"  {icon} <code>{value:.2f} USDT</code>\n"
                     f"  📋 {tx.get('confirmations','?')} onay ✅\n"
                     f"  🕐 {ts_to_str(tx.get('timeStamp'))}\n"
-                    f'  <a href="{explorer_url}{txhash}">TX Goruntule</a>'
+                    f'  <a href="{explorer_url}{txhash}">TX Görüntüle</a>'
                 )
                 last_txhash  = txhash
                 last_network = cfg["network"]
             else:
-                lines.append("  Hic islem bulunamadi.")
+                lines.append("  Hiç işlem bulunamadı.")
 
         elif cfg["network"] == "solana":
             token_account, _bal = await fetch_solana_usdt_account(address, session)
@@ -927,21 +1051,21 @@ async def _sonislem_data():
                         icon = "📥" if is_in else "📤"
                         lines.append(
                             f"  {icon} <code>{amount:.6f} USDT</code>\n"
-                            f"  📋 Onayli ✅\n"
+                            f"  📋 Onaylı ✅\n"
                             f"  🕐 {ts_to_str(block_time)}\n"
-                            f'  <a href="https://solscan.io/tx/{sig}">TX Goruntule</a>'
+                            f'  <a href="https://solscan.io/tx/{sig}">TX Görüntüle</a>'
                         )
                     else:
-                        lines.append("  ℹ️ Son islem USDT transferi degil / parse edilemedi.")
+                        lines.append("  ℹ️ Son işlem USDT transferi değil / ayrıştırılamadı.")
             if sig:
                 last_signature = sig
                 last_network   = "solana"
             elif not token_account:
-                lines.append("  Bu adres icin henuz USDT token hesabi yok.")
+                lines.append("  Bu adres için henüz USDT token hesabı yok.")
             elif not sig:
-                lines.append("  Hic islem bulunamadi.")
+                lines.append("  Hiç işlem bulunamadı.")
 
-    lines.append("\n══════════════════════════════")
+    lines.append(f"\n{DIVIDER}")
     if last_network == "btc" and last_txid:
         keyboard = btc_tx_keyboard(last_txid)
     elif last_network in EVM_NETWORKS and last_txhash:
@@ -954,8 +1078,8 @@ async def _sonislem_data():
 
 def _bekleyenler_data():
     if not pending_txs:
-        return "✅ <b>Bekleyen islem yok.</b>\nTum islemler onaylandi.", main_menu_keyboard()
-    lines = [f"⏳ <b>Bekleyen Islemler</b>\n🕐 {now_str()}\n══════════════════════════════"]
+        return "✅ <b>Bekleyen işlem yok</b>\nTüm işlemler onaylandı.", main_menu_keyboard()
+    lines = [f"⏳ <b>Bekleyen İşlemler</b>\n🕐 {now_str()}\n{DIVIDER}"]
     for txid, info in pending_txs.items():
         typ  = info.get("type", "?")
         if typ == "btc":
@@ -969,8 +1093,25 @@ def _bekleyenler_data():
             f"  🔑 <code>{e(txid[:30])}...</code>\n"
             f"  {link}"
         )
-    lines.append("\n══════════════════════════════")
+    lines.append(f"\n{DIVIDER}")
     return "\n".join(lines), main_menu_keyboard()
+
+def _cuzdanlar_text():
+    if not WALLETS:
+        return (
+            f"📋 <b>Takip Edilen Cüzdanlar</b>\n{DIVIDER}\n"
+            "✨ Henüz takip edilen cüzdan yok.\n"
+            "➕ Eklemek için /cuzdanekle yazabilirsin veya aşağıdaki menüyü kullanabilirsin."
+        )
+    lines = [f"📋 <b>Takip Edilen Cüzdanlar</b> ({len(WALLETS)})\n{DIVIDER}"]
+    for name, cfg in WALLETS.items():
+        lines.append(
+            f"\n{net_emoji(cfg['network'])} <b>{e(name)}</b>\n"
+            f"  🌐 Ağ: {net_label(cfg['network'])}\n"
+            f"  📍 <code>{e(cfg['address'])}</code>"
+        )
+    lines.append(f"\n{DIVIDER}")
+    return "\n".join(lines)
 
 def _sistemkontrol_text():
     uptime_sec = int(time.time() - BOT_START_TIME)
@@ -979,21 +1120,22 @@ def _sistemkontrol_text():
     lines = [
         "🖥️ <b>Sistem Kontrol</b>",
         f"🕐 {now_str()}",
-        "══════════════════════════════",
+        DIVIDER,
         f"⏱ <b>Uptime:</b> <code>{h}s {m}dk {s}sn</code>",
-        f"🔄 <b>Kontrol araligi:</b> <code>{CHECK_INTERVAL_SECONDS} saniye</code>",
-        f"📊 <b>Gunluk ozet:</b> <code>{DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d} UTC</code>",
+        f"🔄 <b>Kontrol aralığı:</b> <code>{CHECK_INTERVAL_SECONDS} saniye</code>",
+        f"📊 <b>Günlük özet:</b> <code>{DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d} UTC</code>",
         "",
         f"👛 <b>Takip edilen:</b> <code>{len(WALLETS)}</code>",
-        f"📝 <b>Gorulmus TX:</b> <code>{sum(len(v) for v in seen_txs.values())}</code>",
+        f"📝 <b>Görülmüş TX:</b> <code>{sum(len(v) for v in seen_txs.values())}</code>",
         f"⏳ <b>Bekleyen TX:</b> <code>{len(pending_txs)}</code>",
-        f"📈 <b>Bugunun islemi:</b> <code>{sum(len(v) for v in daily_txs.values())}</code>",
+        f"📈 <b>Bugünün işlemi:</b> <code>{sum(len(v) for v in daily_txs.values())}</code>",
         "",
     ]
-    net_label = {"btc": "BTC", "eth": "Ethereum", "polygon": "Polygon", "solana": "Solana"}
-    for name, cfg in WALLETS.items():
-        net = net_label.get(cfg["network"], cfg["network"])
-        lines.append(f"  ✅ {e(name)} ({net})")
+    if WALLETS:
+        for name, cfg in WALLETS.items():
+            lines.append(f"  ✅ {net_emoji(cfg['network'])} {e(name)} ({net_label(cfg['network'])})")
+    else:
+        lines.append("  ✨ Henüz cüzdan eklenmedi.")
 
     lines.append("")
     lines.append(f"🌐 <b>Nonlogs Reserves</b> (her {NONLOGS_CHECK_INTERVAL_SECONDS}sn):")
@@ -1003,23 +1145,26 @@ def _sistemkontrol_text():
             if val is not None:
                 lines.append(f"  ✅ {coin}: <code>{val:.{cfg['decimals']}f}</code>")
     else:
-        lines.append("  ⏳ Henuz snapshot alinmadi.")
+        lines.append("  ⏳ Henüz snapshot alınmadı.")
 
-    lines += ["══════════════════════════════", "<i>Tum sistemler calisiyor.</i>"]
+    lines += [DIVIDER, "<i>Tüm sistemler çalışıyor.</i>"]
     return "\n".join(lines)
 
 # ──────────────────────────────────────────────────────
-# KOMUT HANDLERLARI
+# TEMEL KOMUT HANDLERLARI
 # ──────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 <b>Cuzdan Takip Botu</b>\n\n"
-        "Asagidaki butonlari veya komutlari kullanabilirsin:\n\n"
-        "/rapor — Bugunun ozet raporu\n"
-        "/sonislem — Her cüzdanın son islemi\n"
-        "/bakiye — Tum cüzdan bakiyeleri\n"
-        "/saat — Simdi saat kac (TR)\n"
-        "/bekleyenler — Pending islemler\n"
+        "👋 <b>Cüzdan Takip Botu</b>\n\n"
+        "Aşağıdaki butonları veya komutları kullanabilirsin:\n\n"
+        "/rapor — Bugünün özet raporu\n"
+        "/sonislem — Her cüzdanın son işlemi\n"
+        "/bakiye — Tüm cüzdan bakiyeleri\n"
+        "/cuzdanlar — Takip edilen cüzdanların listesi\n"
+        "/cuzdanekle — Yeni cüzdan ekle\n"
+        "/cuzdansil — Bir cüzdanı takipten çıkar\n"
+        "/saat — Şimdi saat kaç (TR)\n"
+        "/bekleyenler — Bekleyen (pending) işlemler\n"
         "/sistemkontrol — Bot durumu\n"
         "/yardim — Bu mesaj",
         parse_mode=ParseMode.HTML,
@@ -1033,8 +1178,8 @@ async def cmd_saat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     utc = datetime.now(tz=timezone.utc)
     tr  = utc + timedelta(hours=3)
     await update.message.reply_text(
-        f"🕐 <b>Simdiki Saat</b>\n\n"
-        f"🇹🇷 <b>Turkiye:</b> <code>{tr.strftime('%d.%m.%Y %H:%M:%S')}</code>\n"
+        f"🕐 <b>Şimdiki Saat</b>\n\n"
+        f"🇹🇷 <b>Türkiye:</b> <code>{tr.strftime('%d.%m.%Y %H:%M:%S')}</code>\n"
         f"🌍 <b>UTC:</b> <code>{utc.strftime('%d.%m.%Y %H:%M:%S')}</code>",
         parse_mode=ParseMode.HTML,
     )
@@ -1045,12 +1190,12 @@ async def cmd_rapor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_sonislem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔄 Veriler cekiliyor...", parse_mode=ParseMode.HTML)
+    msg = await update.message.reply_text("🔄 Veriler çekiliyor...", parse_mode=ParseMode.HTML)
     text, kb = await _sonislem_data()
     await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
 
 async def cmd_bakiye(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔄 Bakiyeler cekiliyor...", parse_mode=ParseMode.HTML)
+    msg = await update.message.reply_text("🔄 Bakiyeler çekiliyor...", parse_mode=ParseMode.HTML)
     await msg.edit_text(await _bakiye_data(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
 
 async def cmd_bekleyenler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1062,8 +1207,201 @@ async def cmd_sistemkontrol(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _sistemkontrol_text(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
     )
 
+async def cmd_cuzdanlar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        _cuzdanlar_text(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
+    )
+
 # ──────────────────────────────────────────────────────
-# CALLBACK HANDLER
+# CÜZDAN EKLEME AKIŞI (ConversationHandler)
+# ──────────────────────────────────────────────────────
+async def cuzdanekle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "➕ <b>Yeni Cüzdan Ekle</b>\n"
+        f"{DIVIDER}\n"
+        "Lütfen takip etmek istediğin ağı seç:"
+    )
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=network_choice_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=network_choice_keyboard())
+    return ADDING_NETWORK
+
+async def cuzdanekle_network_secildi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    network = query.data.replace("addnet_", "")
+
+    if network == "iptal":
+        await query.edit_message_text("❌ Cüzdan ekleme iptal edildi.")
+        return ConversationHandler.END
+
+    ctx.user_data["yeni_network"] = network
+    await query.edit_message_text(
+        f"{net_emoji(network)} <b>{net_label(network)}</b> seçildi.\n"
+        f"{DIVIDER}\n"
+        "Şimdi lütfen cüzdan adresini gönder.\n"
+        "(İptal etmek için /iptal yazabilirsin.)",
+        parse_mode=ParseMode.HTML,
+    )
+    return ADDING_ADDRESS
+
+async def cuzdanekle_adres_alindi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    network = ctx.user_data.get("yeni_network")
+    address = update.message.text.strip()
+
+    if not is_valid_address(network, address):
+        await update.message.reply_text(
+            f"⚠️ Bu adres {net_label(network)} formatına uymuyor gibi görünüyor.\n"
+            "Lütfen adresi kontrol edip tekrar gönder. (İptal için /iptal)"
+        )
+        return ADDING_ADDRESS
+
+    existing = find_wallet_by_address(address)
+    if existing:
+        await update.message.reply_text(
+            f"⚠️ Bu adres zaten <b>{e(existing)}</b> ismiyle takip ediliyor.\n"
+            "Farklı bir adres gönder ya da /iptal ile çık.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADDING_ADDRESS
+
+    ctx.user_data["yeni_address"] = address
+    await update.message.reply_text(
+        "✅ Adres doğrulandı.\n"
+        f"{DIVIDER}\n"
+        "Şimdi bu cüzdana bir isim ver (örn. \"İş Cüzdanı\").\n"
+        "İsim vermek istemezsen \"atla\" yazabilirsin.",
+    )
+    return ADDING_NAME
+
+async def cuzdanekle_isim_alindi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    network = ctx.user_data.get("yeni_network")
+    address = ctx.user_data.get("yeni_address")
+    raw_name = update.message.text.strip()
+
+    if raw_name.lower() in ("atla", "skip", "-"):
+        name = f"{net_label(network).split(' ', 1)[-1].strip()} {address[:6]}"
+    else:
+        name = raw_name[:64]
+
+    base_name = name
+    suffix = 2
+    while name in WALLETS:
+        name = f"{base_name} ({suffix})"
+        suffix += 1
+
+    msg = await update.message.reply_text("🔄 Cüzdan ekleniyor, geçmiş işlemler taranıyor...")
+    await add_wallet(name, network, address)
+
+    await msg.edit_text(
+        "✅ <b>Cüzdan Eklendi</b>\n"
+        f"{DIVIDER}\n"
+        f"{net_emoji(network)} <b>İsim:</b> {e(name)}\n"
+        f"🌐 <b>Ağ:</b> {net_label(network)}\n"
+        f"📍 <code>{e(address)}</code>\n"
+        f"{DIVIDER}\n"
+        "Bundan sonraki işlemler otomatik olarak bildirilecek.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
+    )
+    ctx.user_data.pop("yeni_network", None)
+    ctx.user_data.pop("yeni_address", None)
+    return ConversationHandler.END
+
+async def cuzdanekle_iptal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("yeni_network", None)
+    ctx.user_data.pop("yeni_address", None)
+    await update.message.reply_text("❌ Cüzdan ekleme iptal edildi.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+wallet_add_conversation = ConversationHandler(
+    entry_points=[
+        CommandHandler("cuzdanekle", cuzdanekle_start),
+        CallbackQueryHandler(cuzdanekle_start, pattern="^cuzdanekle_baslat$"),
+    ],
+    states={
+        ADDING_NETWORK: [CallbackQueryHandler(cuzdanekle_network_secildi, pattern="^addnet_")],
+        ADDING_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, cuzdanekle_adres_alindi)],
+        ADDING_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, cuzdanekle_isim_alindi)],
+    },
+    fallbacks=[CommandHandler("iptal", cuzdanekle_iptal)],
+)
+
+# ──────────────────────────────────────────────────────
+# CÜZDAN SİLME AKIŞI (basit callback zinciri, ConversationHandler gerekmiyor)
+# ──────────────────────────────────────────────────────
+async def cuzdansil_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not WALLETS:
+        await query.edit_message_text(
+            "✨ Silinecek bir cüzdan yok.", reply_markup=main_menu_keyboard()
+        )
+        return
+    await query.edit_message_text(
+        "➖ <b>Cüzdan Sil</b>\n"
+        f"{DIVIDER}\n"
+        "Takipten çıkarmak istediğin cüzdanı seç:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=wallet_delete_keyboard(),
+    )
+
+async def cuzdansil_confirm_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    name = query.data.replace("delwallet_", "")
+
+    if name == "iptal":
+        await query.edit_message_text("❌ İşlem iptal edildi.", reply_markup=main_menu_keyboard())
+        return
+
+    cfg = WALLETS.get(name)
+    if not cfg:
+        await query.edit_message_text("⚠️ Bu cüzdan zaten bulunamadı.", reply_markup=main_menu_keyboard())
+        return
+
+    await query.edit_message_text(
+        f"⚠️ <b>{e(name)}</b> ({net_label(cfg['network'])}) cüzdanını takipten çıkarmak\n"
+        "istediğine emin misin?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=wallet_delete_confirm_keyboard(name),
+    )
+
+async def cuzdansil_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    name = query.data.replace("delconfirm_", "")
+    removed = remove_wallet(name)
+    if removed:
+        await query.edit_message_text(
+            f"🗑️ <b>{e(name)}</b> takipten çıkarıldı.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(),
+        )
+    else:
+        await query.edit_message_text("⚠️ Cüzdan bulunamadı (belki zaten silinmiş).", reply_markup=main_menu_keyboard())
+
+async def cuzdansil_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("↩️ Silme işlemi iptal edildi.", reply_markup=main_menu_keyboard())
+
+async def cmd_cuzdansil(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not WALLETS:
+        await update.message.reply_text("✨ Silinecek bir cüzdan yok.", reply_markup=main_menu_keyboard())
+        return
+    await update.message.reply_text(
+        "➖ <b>Cüzdan Sil</b>\n"
+        f"{DIVIDER}\n"
+        "Takipten çıkarmak istediğin cüzdanı seç:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=wallet_delete_keyboard(),
+    )
+
+# ──────────────────────────────────────────────────────
+# GENEL (ANA MENÜ) CALLBACK HANDLER
 # ──────────────────────────────────────────────────────
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1071,12 +1409,12 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data  = query.data
 
     if data == "bakiye":
-        await query.edit_message_text("🔄 Bakiyeler cekiliyor...", parse_mode=ParseMode.HTML)
+        await query.edit_message_text("🔄 Bakiyeler çekiliyor...", parse_mode=ParseMode.HTML)
         await query.edit_message_text(await _bakiye_data(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
     elif data == "rapor":
         await query.edit_message_text(await _rapor_text(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
     elif data == "sonislem":
-        await query.edit_message_text("🔄 Veriler cekiliyor...", parse_mode=ParseMode.HTML)
+        await query.edit_message_text("🔄 Veriler çekiliyor...", parse_mode=ParseMode.HTML)
         text, kb = await _sonislem_data()
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
     elif data == "bekleyenler":
@@ -1084,6 +1422,8 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
     elif data == "sistemkontrol":
         await query.edit_message_text(_sistemkontrol_text(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+    elif data == "cuzdanlar":
+        await query.edit_message_text(_cuzdanlar_text(), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
 
 # ──────────────────────────────────────────────────────
 # GÜNLÜK ÖZET
@@ -1092,7 +1432,7 @@ async def send_daily_report(bot: Bot):
     text = await _rapor_text()
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text=text.replace("Talep Uzerine", "Otomatik").replace("Gunluk Ozet", "Gunluk Ozet Raporu"),
+        text=text.replace("Günlük Özet", "Günlük Özet Raporu (Otomatik)"),
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_keyboard(),
     )
@@ -1106,8 +1446,6 @@ async def send_daily_report(bot: Bot):
 async def main():
     global HTTP_SESSION
 
-    # Tek paylasimli session - baglanti sayisi sinirli tutularak bellek
-    # kullanimini dusuruyoruz (islev/veri kaybi yok, sadece havuz kucultuluyor).
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
     HTTP_SESSION = aiohttp.ClientSession(connector=connector)
 
@@ -1116,6 +1454,16 @@ async def main():
         await initialize_nonlogs_snapshot()
 
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+        # Cuzdan ekleme akisi (ConversationHandler) - digerlerinden ONCE eklenmeli
+        app.add_handler(wallet_add_conversation)
+
+        # Cuzdan silme akisi (ozel pattern'li callback'ler - genel handler'dan ONCE)
+        app.add_handler(CallbackQueryHandler(cuzdansil_menu, pattern="^cuzdansil_baslat$"))
+        app.add_handler(CallbackQueryHandler(cuzdansil_confirm_prompt, pattern="^delwallet_"))
+        app.add_handler(CallbackQueryHandler(cuzdansil_execute, pattern="^delconfirm_"))
+        app.add_handler(CallbackQueryHandler(cuzdansil_cancel, pattern="^delcancel$"))
+
         app.add_handler(CommandHandler("start",         cmd_start))
         app.add_handler(CommandHandler("yardim",        cmd_yardim))
         app.add_handler(CommandHandler("saat",          cmd_saat))
@@ -1124,12 +1472,19 @@ async def main():
         app.add_handler(CommandHandler("bakiye",        cmd_bakiye))
         app.add_handler(CommandHandler("bekleyenler",   cmd_bekleyenler))
         app.add_handler(CommandHandler("sistemkontrol", cmd_sistemkontrol))
+        app.add_handler(CommandHandler("cuzdanlar",     cmd_cuzdanlar))
+        app.add_handler(CommandHandler("cuzdansil",     cmd_cuzdansil))
+
+        # Genel menu butonlari - en sonda, ozel pattern'li olanlardan sonra
         app.add_handler(CallbackQueryHandler(callback_handler))
 
         await app.bot.set_my_commands([
             BotCommand("rapor",         "Bugunun ozet raporu"),
             BotCommand("sonislem",      "Her cuzdanin son islemi"),
             BotCommand("bakiye",        "Tum cuzdan bakiyeleri"),
+            BotCommand("cuzdanlar",     "Takip edilen cuzdanlar"),
+            BotCommand("cuzdanekle",    "Yeni cuzdan ekle"),
+            BotCommand("cuzdansil",     "Bir cuzdani takipten cikar"),
             BotCommand("saat",          "Simdi saat kac (TR)"),
             BotCommand("bekleyenler",   "Pending islemler"),
             BotCommand("sistemkontrol", "Bot durumu ve istatistik"),
@@ -1149,12 +1504,14 @@ async def main():
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
-                "✅ <b>Cuzdan Takip Botu Basladi!</b>\n\n"
-                f"🔍 Takip: {len(WALLETS)} cuzdan\n"
+                "✅ <b>Cüzdan Takip Botu Başladı</b>\n"
+                f"{DIVIDER}\n"
+                f"🔍 Takip: {len(WALLETS)} cüzdan\n"
                 f"⏱ Kontrol: {CHECK_INTERVAL_SECONDS} saniye\n"
                 f"🌐 Nonlogs Reserves (BTC/GRIN/USDT): {NONLOGS_CHECK_INTERVAL_SECONDS} saniyede bir\n"
-                f"📊 Gunluk ozet: {DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d} UTC\n\n"
-                "Komutlar icin /yardim yaz."
+                f"📊 Günlük özet: {DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d} UTC\n"
+                f"{DIVIDER}\n"
+                "➕ Yeni cüzdan eklemek için /cuzdanekle, komut listesi için /yardim yazabilirsin."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu_keyboard(),
